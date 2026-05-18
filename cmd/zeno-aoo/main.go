@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/agent"
@@ -10,40 +12,41 @@ import (
 )
 
 func main() {
-	fmt.Println("🧠 Zeno OS: Booting Neural Infrastructure...")
+	fmt.Println("🧠 Zeno OS: Booting Autonomous Neural Infrastructure...")
 
-	// 1. Ignite the Neo4j Memory Store
+	// 1. Parse terminal inputs dynamically
+	searchQuery := "Lagos supply chain logistics PLC" // Default fallback parameter
+	if len(os.Args) > 1 {
+		// Joins any phrase passed after the run command
+		searchQuery = strings.Join(os.Args[1:], " ")
+	}
+
+	// 2. Ignite the Neo4j Memory Store
 	brain, err := memory.NewSovereignStore("bolt://localhost:7687", "neo4j", "zeno_admin_password")
 	if err != nil {
 		panic(fmt.Sprintf("❌ CRITICAL: Failed to boot Neural Graph: %v", err))
 	}
 	defer brain.Close() 
 
-	// 2. Ignite the Router
+	// 3. Ignite the Router
 	router := orchestrator.NewEventRouter()
 	router.Start()
 
-	// 3. Initialize the Sentinel
+	// 4. Initialize and Subscribe the Sentinel (Brain)
 	sentinelAgent := agent.NewSentinel(brain)
 	router.Subscribe(sentinelAgent.React)
 
-	// 4. Initialize the Predator
+	// 5. Initialize and Subscribe the Predator (Eyes)
 	predatorAgent := agent.NewPredator(router)
-	
-	// 5. Define a pipeline of targets (Using safe, highly available public text domains for validation)
-	targets := []string{
-		"https://example.com",
-		"https://www.iana.org/domains/reserved",
-	}
+	router.Subscribe(predatorAgent.React) 
 
-	fmt.Printf("🦅 [SYSTEM] Deploying Predator concurrently across %d targets...\n", len(targets))
+	// 6. Initialize the Discovery Agent (The Ingestion Funnel)
+	discoveryAgent := agent.NewDiscoveryAgent(router)
 	
-	// 6. Launch the Predator across all targets using concurrent goroutines
-	for _, target := range targets {
-		go predatorAgent.Hunt(target)
-	}
+	// 7. TRIGGER THE LOOPS: Hand the dynamic parameters to the pipeline
+	go discoveryAgent.ExtractLeads(searchQuery)
 
-	// 7. Keep the core runtime alive long enough to process all async events through the bus
-	time.Sleep(45 * time.Second)
+	// 8. Keep runtime alive for async channel lifecycle execution
+	time.Sleep(60 * time.Second)
 	fmt.Println("\n🛑 [SYSTEM] Execution lifecycle complete. Powering down.")
 }

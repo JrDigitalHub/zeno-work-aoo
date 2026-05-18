@@ -19,6 +19,15 @@ func NewPredator(r *orchestrator.EventRouter) *Predator {
 	return &Predator{router: r}
 }
 
+// React allows the Predator to listen to the Event Router autonomously
+func (p *Predator) React(e protocol.Event) {
+	// If the event source is DISCOVERY, automatically hunt the URL in the payload
+	if e.Source == "DISCOVERY" {
+		fmt.Printf("🦅 [PREDATOR] Intercepted Discovery telemetry. Arming systems for: %s\n", e.Payload)
+		go p.Hunt(e.Payload)
+	}
+}
+
 func (p *Predator) Hunt(targetURL string) {
 	fmt.Printf("🦅 [PREDATOR] Deep crawling initialized for domain: %s\n", targetURL)
 
@@ -40,7 +49,6 @@ func (p *Predator) Hunt(targetURL string) {
 		Delay:       1 * time.Second,
 	})
 
-	// Use a map to isolate text extraction to its specific subpage URL
 	pageContentMap := make(map[string][]string)
 
 	c.OnHTML("title, h1, h2, p", func(e *colly.HTMLElement) {
@@ -59,11 +67,8 @@ func (p *Predator) Hunt(targetURL string) {
 		}
 	})
 
-	// Fires per individual subpage completion
 	c.OnScraped(func(r *colly.Response) {
 		currentSubpageURL := r.Request.URL.String()
-		
-		// Grab only the text collected for THIS specific subpage
 		texts := pageContentMap[currentSubpageURL]
 		fullCorpus := strings.Join(texts, " | ")
 		
@@ -73,7 +78,6 @@ func (p *Predator) Hunt(targetURL string) {
 
 		fmt.Printf("🦅 [PREDATOR] Subpage indexing complete: [%s]\n", currentSubpageURL)
 
-		// Publish the specific subpage URL as the unique Event ID
 		p.router.Publish(protocol.Event{
 			ID:        currentSubpageURL, 
 			Source:    "PREDATOR",
