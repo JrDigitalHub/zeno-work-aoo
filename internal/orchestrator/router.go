@@ -1,49 +1,42 @@
 package orchestrator
 
-import "fmt"
+import (
+	"fmt"
+	"github.com/JrDigitalHub/zeno-work-aoo/pkg/protocol"
+)
 
-type Event struct {
-	ID      string
-	Source  string
-	Payload string
-}
-
-// 1. Define a "Handler" - any function that takes an Event as a parameter
-type EventHandler func(Event)
+// 1. The router now strictly uses the protocol.Event
+type EventHandler func(protocol.Event)
 
 type EventRouter struct {
-	eventBus   chan Event
-	subscribers []EventHandler // A list of agents listening to the bus
+	eventBus    chan protocol.Event
+	subscribers []EventHandler
 }
 
 func NewEventRouter() *EventRouter {
 	return &EventRouter{
-		eventBus:    make(chan Event),
+		eventBus:    make(chan protocol.Event),
 		subscribers: make([]EventHandler, 0),
 	}
 }
 
-// 2. Subscribe allows agents to plug their ears into the Router
 func (r *EventRouter) Subscribe(handler EventHandler) {
 	r.subscribers = append(r.subscribers, handler)
 }
 
 func (r *EventRouter) Start() {
-	fmt.Println("🛡️ [ROUTER] Core routing engine online. Awaiting telemetry...")
+	fmt.Println("🛡️ [ROUTER] Protocol Engine online. Awaiting telemetry...")
 	
 	go func() {
 		for {
 			incomingEvent := <-r.eventBus
-			
-			// 3. When an event hits the bus, loop through all subscribers and hand it to them
 			for _, handler := range r.subscribers {
-				// We run the handler as a goroutine so slow agents don't block the router!
-				go handler(incomingEvent) 
+				go handler(incomingEvent)
 			}
 		}
 	}()
 }
 
-func (r *EventRouter) Publish(e Event) {
+func (r *EventRouter) Publish(e protocol.Event) {
 	r.eventBus <- e
 }
