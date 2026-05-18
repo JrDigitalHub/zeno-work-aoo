@@ -2,12 +2,13 @@ package agent
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
-	"github.com/gocolly/colly/v2"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/orchestrator"
 	"github.com/JrDigitalHub/zeno-work-aoo/pkg/protocol"
+	"github.com/gocolly/colly/v2"
 )
 
 type Predator struct {
@@ -15,37 +16,74 @@ type Predator struct {
 }
 
 func NewPredator(r *orchestrator.EventRouter) *Predator {
-	return &Predator{
-		router: r,
-	}
+	return &Predator{router: r}
 }
 
 func (p *Predator) Hunt(targetURL string) {
-	fmt.Printf("🦅 [PREDATOR] Sovereign extraction initiated. Breaching: %s\n", targetURL)
+	fmt.Printf("🦅 [PREDATOR] Deep crawling initialized for domain: %s\n", targetURL)
 
-	c := colly.NewCollector()
-	var extractedData []string
+	parsedURL, err := url.Parse(targetURL)
+	if err != nil {
+		fmt.Printf("❌ [PREDATOR] Malformed seed URL: %v\n", err)
+		return
+	}
+	allowedDomain := parsedURL.Host
 
-	c.OnHTML("title", func(e *colly.HTMLElement) {
-		extractedData = append(extractedData, "Title: "+e.Text)
+	c := colly.NewCollector(
+		colly.AllowedDomains(allowedDomain),
+		colly.MaxDepth(2),
+	)
+
+	c.Limit(&colly.LimitRule{
+		DomainGlob:  "*",
+		Parallelism: 2,
+		Delay:       1 * time.Second,
 	})
 
-	c.OnScraped(func(r *colly.Response) {
-		fmt.Println("🦅 [PREDATOR] Extraction complete. Formatting payload...")
-		
-		finalPayload := strings.Join(extractedData, " | ")
+	// Use a map to isolate text extraction to its specific subpage URL
+	pageContentMap := make(map[string][]string)
 
-		// Fire the data using the official protocol
+	c.OnHTML("title, h1, h2, p", func(e *colly.HTMLElement) {
+		currentURL := e.Request.URL.String()
+		text := strings.TrimSpace(e.Text)
+		if text != "" {
+			pageContentMap[currentURL] = append(pageContentMap[currentURL], text)
+		}
+	})
+
+	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
+		link := e.Attr("href")
+		absoluteURL := e.Request.AbsoluteURL(link)
+		if absoluteURL != "" {
+			e.Request.Visit(absoluteURL)
+		}
+	})
+
+	// Fires per individual subpage completion
+	c.OnScraped(func(r *colly.Response) {
+		currentSubpageURL := r.Request.URL.String()
+		
+		// Grab only the text collected for THIS specific subpage
+		texts := pageContentMap[currentSubpageURL]
+		fullCorpus := strings.Join(texts, " | ")
+		
+		if len(fullCorpus) > 2000 {
+			fullCorpus = fullCorpus[:2000]
+		}
+
+		fmt.Printf("🦅 [PREDATOR] Subpage indexing complete: [%s]\n", currentSubpageURL)
+
+		// Publish the specific subpage URL as the unique Event ID
 		p.router.Publish(protocol.Event{
-			ID:        targetURL, // We use the URL as the unique Graph ID
+			ID:        currentSubpageURL, 
 			Source:    "PREDATOR",
-			Payload:   finalPayload,
+			Payload:   fullCorpus,
 			Timestamp: time.Now().Unix(),
 		})
 	})
 
 	c.OnError(func(r *colly.Response, err error) {
-		fmt.Printf("❌ [PREDATOR] Breach failed: %s\n", err)
+		fmt.Printf("⚠️ [PREDATOR] Resource skipped at %s: %v\n", r.Request.URL, err)
 	})
 
 	c.Visit(targetURL)
