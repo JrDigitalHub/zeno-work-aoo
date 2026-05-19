@@ -7,47 +7,55 @@ import (
 	"time"
 
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/agent"
+	"github.com/JrDigitalHub/zeno-work-aoo/internal/backoffice"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/comms"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/memory"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/orchestrator"
 )
 
 func main() {
-	fmt.Println("🧠 Zeno OS: Booting Autonomous Neural Infrastructure with Voice Core...")
+	fmt.Println("🧠 Zeno OS: Booting Unified Neural Infrastructure [Graph + Vector Memory + Back-Office]...")
 
-	searchQuery := "Lagos supply chain logistics PLC"
+	searchQuery := "Corporate law firms in Lagos"
 	if len(os.Args) > 1 {
 		searchQuery = strings.Join(os.Args[1:], " ")
 	}
 
-	// 1. Ignite the Neo4j Memory Store
-	brain, err := memory.NewSovereignStore("bolt://localhost:7687", "neo4j", "zeno_admin_password")
+	// 1. Ignite the Neo4j Graph Memory Store
+	graphBrain, err := memory.NewSovereignStore("bolt://localhost:7687", "neo4j", "zeno_admin_password")
 	if err != nil {
-		panic(fmt.Sprintf("❌ CRITICAL: Failed to boot Neural Graph: %v", err))
+		panic(fmt.Sprintf("❌ CRITICAL: Failed to boot Graph Memory: %v", err))
 	}
-	defer brain.Close() 
+	defer graphBrain.Close() 
 
-	// 2. Ignite the Router
+	// 2. Ignite the Qdrant Vector Memory Store
+	vectorBrain, err := memory.NewVectorStore("localhost:6334", "zeno_intel_vectors")
+	if err != nil {
+		panic(fmt.Sprintf("❌ CRITICAL: Failed to boot Vector Memory: %v", err))
+	}
+	defer vectorBrain.Close()
+
+	// 3. Initialize the Back-Office Engine with a strict capacity pipeline of 3
+	opsManager := backoffice.NewManager(3)
+
+	// 4. Ignite the Router Bus
 	router := orchestrator.NewEventRouter()
 	router.Start()
 
-	// 3. Initialize and Subscribe the Sentinel (Now passes router link)
-	sentinelAgent := agent.NewSentinel(brain, router)
+	// 5. Initialize the Sentinel with access to BOTH brains AND the Back-Office
+	sentinelAgent := agent.NewSentinel(graphBrain, vectorBrain, opsManager, router)
 	router.Subscribe(sentinelAgent.React)
 
-	// 4. Initialize and Subscribe the Predator (Scraper)
+	// 6. Initialize other agents
 	predatorAgent := agent.NewPredator(router)
 	router.Subscribe(predatorAgent.React) 
 
-	// 5. Initialize and Subscribe the Sovereign Voice Core (Whisper/StyleTTS2 handles)
-	// Port 4321 is the standard default port for local StyleTTS2 inference endpoints
 	voiceEngine := comms.NewVoiceEngine("http://localhost:8000", "http://localhost:4321")
 	router.Subscribe(voiceEngine.React)
 
-	// 6. Initialize the Discovery Agent 
 	discoveryAgent := agent.NewDiscoveryAgent(router)
 	
-	// 7. Fire the loop
+	// 7. Deploy the automated extraction chain reaction
 	go discoveryAgent.ExtractLeads(searchQuery)
 
 	time.Sleep(60 * time.Second)
