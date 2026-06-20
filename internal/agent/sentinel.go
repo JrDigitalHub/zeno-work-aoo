@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/backoffice"
@@ -19,6 +20,7 @@ type Sentinel struct {
 	vectorStore *memory.VectorStore
 	backOffice  *backoffice.Manager
 	router      *orchestrator.EventRouter
+	apiKey      string
 }
 
 func NewSentinel(gs *memory.SovereignStore, vs *memory.VectorStore, bo *backoffice.Manager, r *orchestrator.EventRouter) *Sentinel {
@@ -27,27 +29,39 @@ func NewSentinel(gs *memory.SovereignStore, vs *memory.VectorStore, bo *backoffi
 		vectorStore: vs,
 		backOffice:  bo,
 		router:      r,
+		apiKey:      os.Getenv("GEMINI_API_KEY"),
 	}
 }
 
-type OllamaRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
-	Stream bool   `json:"stream"`
+// Gemini API Payload Structures
+type GeminiContent struct {
+	Parts []GeminiPart `json:"parts"`
 }
 
-type OllamaResponse struct {
-	Response string `json:"response"`
+type GeminiPart struct {
+	Text string `json:"text"`
 }
 
-// Structures for generating embeddings locally
-type EmbeddingRequest struct {
-	Model  string `json:"model"`
-	Prompt string `json:"prompt"`
+type GeminiGenerateRequest struct {
+	Contents []GeminiContent `json:"contents"`
 }
 
-type EmbeddingResponse struct {
-	Embedding []float32 `json:"embedding"`
+type GeminiGenerateResponse struct {
+	Candidates []struct {
+		Content struct {
+			Parts []GeminiPart `json:"parts"`
+		} `json:"content"`
+	} `json:"candidates"`
+}
+
+type GeminiEmbeddingRequest struct {
+	Content GeminiContent `json:"content"`
+}
+
+type GeminiEmbeddingResponse struct {
+	Embedding struct {
+		Values []float32 `json:"values"`
+	} `json:"embedding"`
 }
 
 func (s *Sentinel) React(e protocol.Event) {
@@ -58,18 +72,24 @@ func (s *Sentinel) React(e protocol.Event) {
 			return
 		}
 
-		// 2. NEW: Back-Office Capacity Check
+		// 2. Back-Office Capacity Check
 		if !s.backOffice.CheckCapacity() {
 			fmt.Printf("⛔ [SENTINEL] Back-Office rejected workflow for [%s]: Internal capacity maxed out.\n", e.ID)
 			return
 		}
 
-		// 3. NEW: Immediately reserve the pipeline slot so concurrent subpages don't flood the system
+		// 3. Immediately reserve the pipeline slot so concurrent subpages don't flood the system
 		s.backOffice.RegisterPipeline(e.ID)
 
 		fmt.Printf("\n⚙️ [SENTINEL] Processing New Context! Target ID: %s\n", e.ID)
 
-		// 4. Local Embedding Generation Loop via Ollama
+		// Check for API Key presence
+		if s.apiKey == "" {
+			fmt.Println("❌ [SENTINEL] Critical configuration failure: GEMINI_API_KEY environment variable is empty.")
+			return
+		}
+
+		// 4. Cloud Embedding Generation Loop via Gemini API
 		fmt.Println("⚙️ [SENTINEL] Generating high-dimensional vector embeddings...")
 		vector, err := s.getEmbedding(e.Payload)
 		if err != nil {
@@ -87,44 +107,57 @@ func (s *Sentinel) React(e protocol.Event) {
 			fmt.Printf("⚠️ [SENTINEL] Vector upsert failure: %v\n", err)
 		}
 
-		// 6. Strategic reasoning loop using local inference text completion
-		fmt.Println("⚙️ [SENTINEL] Engaging Local Neural Core for strategic writing...")
+		// 6. Strategic reasoning loop using cloud inference text completion
+		fmt.Println("⚙️ [SENTINEL] Engaging Cloud Neural Core for strategic writing...")
 
-		// 👉 ADD THIS SAFETY SCISSORS BLOCK:
 		safePayload := fmt.Sprintf("%v", e.Payload)
-		if len(safePayload) > 3000 {
-			safePayload = safePayload[:3000] // Keep only the first 3000 characters to prevent LLM memory crashes
+		if len(safePayload) > 6000 {
+			safePayload = safePayload[:6000] // Upgraded memory ceiling for robust cloud context matching
 		}
 
-		// UPGRADED PROMPT FOR HIGH-CONVERTING SDR OUTREACH
 		prompt := fmt.Sprintf(`You are an elite, outcome-oriented B2B Sales Director. Read the following website data to understand what the company does. Then, write a ruthless, 2-sentence cold email to their founder. 
-		
-		RULES:
-		1. Sentence 1 must state that our autonomous AI pipeline can scale their specific offering. 
-		2. Sentence 2 must ask for a quick meeting. 
-		3. Do not use polite greetings like 'Dear' or 'Hope you are well'.
-		4. OUTPUT ONLY THE EMAIL TEXT. NO PREAMBLE. NO EXPLANATIONS. NO NOTES.
+        
+        RULES:
+        1. Sentence 1 must state that our autonomous AI pipeline can scale their specific offering. 
+        2. Sentence 2 must ask for a quick meeting. 
+        3. Do not use polite greetings like 'Dear' or 'Hope you are well'.
+        4. OUTPUT ONLY THE EMAIL TEXT. NO PREAMBLE. NO EXPLANATIONS. NO NOTES.
 
-		Website Data: %s`, safePayload)
+        Website Data: %s`, safePayload)
 
-		reqBody, _ := json.Marshal(OllamaRequest{
-			Model:  "llama3.2",
-			Prompt: prompt,
-			Stream: false,
+		reqBody, _ := json.Marshal(GeminiGenerateRequest{
+			Contents: []GeminiContent{
+				{Parts: []GeminiPart{{Text: prompt}}},
+			},
 		})
 
-		resp, err := http.Post("http://localhost:11434/api/generate", "application/json", bytes.NewBuffer(reqBody))
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s", s.apiKey)
+		resp, err := http.Post(url, "application/json", bytes.NewBuffer(reqBody))
 		if err != nil {
-			fmt.Println("❌ [SENTINEL] Neural Core offline.")
+			fmt.Printf("❌ [SENTINEL] Neural Core connection error: %v\n", err)
 			return
 		}
 		defer resp.Body.Close()
 
-		body, _ := io.ReadAll(resp.Body)
-		var ollamaResp OllamaResponse
-		json.Unmarshal(body, &ollamaResp)
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			fmt.Printf("❌ [SENTINEL] Neural Core execution error status %d: %s\n", resp.StatusCode, string(body))
+			return
+		}
 
-		fmt.Printf("\n✅ [SENTINEL] Sovereign Intelligence Generated:\n\n%s\n\n", ollamaResp.Response)
+		body, _ := io.ReadAll(resp.Body)
+		var geminiResp GeminiGenerateResponse
+		json.Unmarshal(body, &geminiResp)
+
+		responseText := ""
+		if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
+			responseText = geminiResp.Candidates[0].Content.Parts[0].Text
+		} else {
+			fmt.Println("❌ [SENTINEL] Neural Core returned empty inference matrix response.")
+			return
+		}
+
+		fmt.Printf("\n✅ [SENTINEL] Sovereign Intelligence Generated:\n\n%s\n\n", responseText)
 
 		// 7. Anchor relationship data in Neo4j Graph
 		s.graphStore.Save(protocol.MemoryNode{
@@ -137,31 +170,42 @@ func (s *Sentinel) React(e protocol.Event) {
 		s.router.Publish(protocol.Event{
 			ID:        e.ID,
 			Source:    "SENTINEL_TEXT_OUTPUT",
-			Payload:   ollamaResp.Response,
+			Payload:   responseText,
 			Timestamp: time.Now().Unix(),
 		})
 	}
 }
 
-// getEmbedding calls local Ollama endpoint to return vector matrices
+// getEmbedding calls the Gemini API endpoint to return 768-dimensional vector matrices
 func (s *Sentinel) getEmbedding(text string) ([]float32, error) {
-	embReq, _ := json.Marshal(EmbeddingRequest{
-		Model:  "nomic-embed-text", // Qwen natively supports feature extraction embeddings
-		Prompt: text,
+	embReq, _ := json.Marshal(GeminiEmbeddingRequest{
+		Content: GeminiContent{
+			Parts: []GeminiPart{{Text: text}},
+		},
 	})
 
-	resp, err := http.Post("http://localhost:11434/api/embeddings", "application/json", bytes.NewBuffer(embReq))
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=%s", s.apiKey)
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(embReq))
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API endpoint returned error status %d: %s", resp.StatusCode, string(body))
+	}
+
 	body, _ := io.ReadAll(resp.Body)
-	var embResp EmbeddingResponse
+	var embResp GeminiEmbeddingResponse
 	err = json.Unmarshal(body, &embResp)
 	if err != nil {
 		return nil, err
 	}
 
-	return embResp.Embedding, nil
+	if len(embResp.Embedding.Values) == 0 {
+		return nil, fmt.Errorf("empty embeddings returned from cloud provider matrix")
+	}
+
+	return embResp.Embedding.Values, nil
 }
