@@ -132,7 +132,7 @@ func (s *Sentinel) React(e protocol.Event) {
 			},
 		})
 
-		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-001:generateContent?key=%s", s.apiKey)
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=%s", s.apiKey)
 		resp, err := http.Post(url, "application/json", bytes.NewBuffer(reqBody))
 		if err != nil {
 			fmt.Printf("❌ [SENTINEL] Neural Core connection error: %v\n", err)
