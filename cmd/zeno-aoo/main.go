@@ -31,28 +31,47 @@ func main() {
 		searchQuery = strings.Join(os.Args[1:], " ")
 	}
 
-	// 1. Ignite Neo4j
-	graphBrain, err := memory.NewSovereignStore("bolt://localhost:7687", "neo4j", "zeno_admin_password")
+	// 1. Ignite Neo4j (NOW CLOUD READY)
+	neo4jURI := os.Getenv("NEO4J_URI")
+	if neo4jURI == "" {
+		neo4jURI = "bolt://localhost:7687"
+	}
+	neo4jUser := os.Getenv("NEO4J_USERNAME")
+	if neo4jUser == "" {
+		neo4jUser = "neo4j"
+	}
+	neo4jPass := os.Getenv("NEO4J_PASSWORD")
+	if neo4jPass == "" {
+		neo4jPass = "zeno_admin_password"
+	}
+
+	graphBrain, err := memory.NewSovereignStore(neo4jURI, neo4jUser, neo4jPass)
 	if err != nil {
 		panic(fmt.Sprintf("❌ CRITICAL: Failed to boot Graph Memory: %v", err))
 	}
 	defer graphBrain.Close()
+	fmt.Println("🧠 [MEMORY] Neural Graph (Neo4j) connected successfully.")
 
-	// 2. Ignite Qdrant
-	vectorBrain, err := memory.NewVectorStore("localhost:6334", "zeno_intel_vectors_v3")
+	// 2. Ignite Qdrant (NOW CLOUD READY)
+	qdrantURL := os.Getenv("QDRANT_URL")
+	if qdrantURL == "" {
+		qdrantURL = "localhost:6334"
+	}
+
+	vectorBrain, err := memory.NewVectorStore(qdrantURL, "zeno_intel_vectors_v3")
 	if err != nil {
 		panic(fmt.Sprintf("❌ CRITICAL: Failed to boot Vector Memory: %v", err))
 	}
 	defer vectorBrain.Close()
+	fmt.Println("📐 [VECTOR] Semantic Memory connected successfully.")
 
 	// 2.5 Ignite Relational Brain (Supabase / Postgres)
-	var relationalBrain *memory.RelationalStore // 👉 DECLARE IT HERE SO THE WHOLE SYSTEM CAN SEE IT
+	var relationalBrain *memory.RelationalStore
 
 	supabaseURL := os.Getenv("SUPABASE_URL")
 	if supabaseURL == "" {
 		fmt.Println("⚠️ WARNING: SUPABASE_URL not found in environment. State persistence is offline.")
 	} else {
-		// Initialize it and assign it to our globally scoped variable
 		store, err := memory.NewRelationalStore(supabaseURL)
 		if err != nil {
 			panic(fmt.Sprintf("❌ CRITICAL: Failed to boot Relational Memory: %v", err))
