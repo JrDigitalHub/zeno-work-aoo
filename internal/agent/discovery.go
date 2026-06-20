@@ -1,48 +1,100 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
+	"github.com/JrDigitalHub/zeno-work-aoo/internal/memory"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/orchestrator"
 	"github.com/JrDigitalHub/zeno-work-aoo/pkg/protocol"
 )
 
 type DiscoveryAgent struct {
 	router *orchestrator.EventRouter
+	DB     *memory.RelationalStore // 👉 Injected the database so it matches main.go
 }
 
-func NewDiscoveryAgent(r *orchestrator.EventRouter) *DiscoveryAgent {
-	return &DiscoveryAgent{router: r}
+// Updated to accept the database connection during boot
+func NewDiscoveryAgent(r *orchestrator.EventRouter, db *memory.RelationalStore) *DiscoveryAgent {
+	return &DiscoveryAgent{
+		router: r,
+		DB:     db,
+	}
 }
 
-// ExtractLeads simulates an advanced Google Maps/Search engine scrape pipeline
+// AlgoliaResponse maps the JSON structure returned by the Hacker News API
+type AlgoliaResponse struct {
+	Hits []struct {
+		URL string `json:"url"`
+	} `json:"hits"`
+}
+
+// ExtractLeads initiates a live API scan bypassing HTML bot-blockers
 func (d *DiscoveryAgent) ExtractLeads(query string) {
-	fmt.Printf("🔍 [DISCOVERY] Ingesting sector parameters: \"%s\"\n", query)
-	fmt.Println("🔍 [DISCOVERY] Scanning digital landscapes, business indexes, and registries...")
-	
-	// Simulating network query latency
-	time.Sleep(3 * time.Second)
+	fmt.Printf("🔍 [DISCOVERY] Live API Hunt Initiated. Target Sector: \"%s\"\n", query)
+	fmt.Println("🔍 [DISCOVERY] Bypassing HTML walls. Tapping into Hacker News Algolia JSON interface...")
 
-	// Curated real-world targets matching your pipeline query for testing
-	discoveredWebsites := []string{
-		"https://example.com",
-		"https://www.iana.org/domains/reserved",
+	// Encode the query and hit the API
+	encodedQuery := url.QueryEscape(query)
+	apiURL := fmt.Sprintf("https://hn.algolia.com/api/v1/search?query=%s&tags=story", encodedQuery)
+
+	resp, err := http.Get(apiURL)
+	if err != nil {
+		fmt.Printf("❌ [DISCOVERY] API grid offline: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var result AlgoliaResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		fmt.Printf("❌ [DISCOVERY] Failed to decode telemetry: %v\n", err)
+		return
 	}
 
-	fmt.Printf("✅ [DISCOVERY] Pipeline extraction complete. Found %d target entities.\n", len(discoveredWebsites))
+	uniqueTargets := make(map[string]bool)
+	var finalTargets []string
 
-	for _, url := range discoveredWebsites {
-		fmt.Printf("📡 [DISCOVERY] Streaming unverified target to router: %s\n", url)
-		
+	// Filter and validate the raw URLs
+	for _, hit := range result.Hits {
+		link := hit.URL
+		if link != "" &&
+			strings.HasPrefix(link, "http") &&
+			!strings.Contains(link, "ycombinator.com") &&
+			!strings.Contains(link, "github.com") &&
+			!strings.Contains(link, "medium.com") &&
+			!strings.Contains(link, "nytimes.com") &&
+			!strings.Contains(link, "youtube.com") {
+
+			if !uniqueTargets[link] {
+				// Note: Since this agent only handles URLs right now, we rely on the
+				// downstream EmailEngine to check if the target's EMAIL exists in the DB before sending!
+				uniqueTargets[link] = true
+				finalTargets = append(finalTargets, link)
+			}
+		}
+
+		if len(finalTargets) >= 4 {
+			break
+		}
+	}
+
+	fmt.Printf("✅ [DISCOVERY] Live API scan complete. Acquired %d fresh target coordinates.\n", len(finalTargets))
+
+	// Stream the live targets into the ZENO Neural Bus
+	for _, target := range finalTargets {
+		fmt.Printf("📡 [DISCOVERY] Streaming live target to router: %s\n", target)
+
 		d.router.Publish(protocol.Event{
-			ID:        url,
+			ID:        target,
 			Source:    "DISCOVERY",
-			Payload:   url, // The payload is the raw target URL for the Predator to hunt
+			Payload:   target,
 			Timestamp: time.Now().Unix(),
 		})
-		
-		// Small delay between streaming to prevent network flooding
-		time.Sleep(500 * time.Millisecond)
+
+		time.Sleep(1 * time.Second)
 	}
 }

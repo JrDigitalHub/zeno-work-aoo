@@ -43,11 +43,11 @@ func (o *Oracle) React(e protocol.Event) {
 			fmt.Println("🔮 [ORACLE] EXECUTIVE INTELLIGENCE REPORT")
 			fmt.Println("=======================================================")
 			fmt.Println("⚠️ SYSTEM BOTTLENECK DETECTED: Automated outreach pipeline is currently operating at 100% capacity limit (3/3 active workflows).")
-			fmt.Println("💡 STRATEGIC RECOMMENDATION: To prevent lead decay on the rejected prospects, temporarily route overflow targeting directly to Joshua (Human Closer) while we scale the automated Back-Office thresholds.")
-			fmt.Println("=======================================================\n")
+			fmt.Println("💡 STRATEGIC RECOMMENDATION: Throttling discovery intake. All overflow targets will be cached in the Vector queue until Back-Office capacity clears.")
+			fmt.Println("=======================================================")
 			return
 		}
-		
+
 		// Always unlock if the condition wasn't met
 		o.mu.Unlock()
 	}

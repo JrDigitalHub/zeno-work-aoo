@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  # 1. Sovereign Graph Memory
+  neo4j:
+    image: neo4j:5
+    container_name: zeno_graph_db
+    ports:
+      - "7474:7474" # Browser UI
+      - "7687:7687" # Bolt Protocol (What your Go code uses)
+    environment:
+      - NEO4J_AUTH=neo4j/zeno_admin_password
+    volumes:
+      - neo4j_data:/data
+
+  # 2. Semantic Vector Memory
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: zeno_vector_db
+    ports:
+      - "6333:6333" # REST API
+      - "6334:6334" # gRPC Protocol (What your Go code uses)
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  # 3. Local Neural Intelligence
+  ollama:
+    image: ollama/ollama:latest
+    container_name: zeno_neural_core
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  neo4j_data:
+  qdrant_data:
+  ollama_data:

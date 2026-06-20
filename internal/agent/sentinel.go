@@ -89,10 +89,26 @@ func (s *Sentinel) React(e protocol.Event) {
 
 		// 6. Strategic reasoning loop using local inference text completion
 		fmt.Println("⚙️ [SENTINEL] Engaging Local Neural Core for strategic writing...")
-		prompt := fmt.Sprintf("You are a technical business strategist. Write a 2-sentence cold message to the owner of this website. Be direct. Website Data: %s", e.Payload)
+
+		// 👉 ADD THIS SAFETY SCISSORS BLOCK:
+		safePayload := fmt.Sprintf("%v", e.Payload)
+		if len(safePayload) > 3000 {
+			safePayload = safePayload[:3000] // Keep only the first 3000 characters to prevent LLM memory crashes
+		}
+
+		// UPGRADED PROMPT FOR HIGH-CONVERTING SDR OUTREACH
+		prompt := fmt.Sprintf(`You are an elite, outcome-oriented B2B Sales Director. Read the following website data to understand what the company does. Then, write a ruthless, 2-sentence cold email to their founder. 
+		
+		RULES:
+		1. Sentence 1 must state that our autonomous AI pipeline can scale their specific offering. 
+		2. Sentence 2 must ask for a quick meeting. 
+		3. Do not use polite greetings like 'Dear' or 'Hope you are well'.
+		4. OUTPUT ONLY THE EMAIL TEXT. NO PREAMBLE. NO EXPLANATIONS. NO NOTES.
+
+		Website Data: %s`, safePayload)
 
 		reqBody, _ := json.Marshal(OllamaRequest{
-			Model:  "qwen2.5:0.5b",
+			Model:  "llama3.2",
 			Prompt: prompt,
 			Stream: false,
 		})
@@ -130,7 +146,7 @@ func (s *Sentinel) React(e protocol.Event) {
 // getEmbedding calls local Ollama endpoint to return vector matrices
 func (s *Sentinel) getEmbedding(text string) ([]float32, error) {
 	embReq, _ := json.Marshal(EmbeddingRequest{
-		Model:  "qwen2.5:0.5b", // Qwen natively supports feature extraction embeddings
+		Model:  "nomic-embed-text", // Qwen natively supports feature extraction embeddings
 		Prompt: text,
 	})
 

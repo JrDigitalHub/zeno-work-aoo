@@ -36,8 +36,8 @@ func NewVectorStore(address string, collectionName string) (*VectorStore, error)
 		err = client.CreateCollection(ctx, &qdrant.CreateCollection{
 			CollectionName: collectionName,
 			VectorsConfig: qdrant.NewVectorsConfig(&qdrant.VectorParams{
-				Size:     1024, 
-				Distance: qdrant.Distance_Cosine, 
+				Size:     768,
+				Distance: qdrant.Distance_Cosine,
 			}),
 		})
 		if err != nil {
@@ -58,7 +58,7 @@ func (v *VectorStore) Close() {
 func (v *VectorStore) UpsertVector(id string, vector []float32, payload map[string]any) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	
+
 	// 1. Hash the URL string into a deterministic uint64 integer
 	h := fnv.New64a()
 	h.Write([]byte(id))
