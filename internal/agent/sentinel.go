@@ -55,7 +55,8 @@ type GeminiGenerateResponse struct {
 }
 
 type GeminiEmbeddingRequest struct {
-	Content GeminiContent `json:"content"`
+	Content              GeminiContent `json:"content"`
+	OutputDimensionality int           `json:"outputDimensionality"`
 }
 
 type GeminiEmbeddingResponse struct {
@@ -182,9 +183,11 @@ func (s *Sentinel) getEmbedding(text string) ([]float32, error) {
 		Content: GeminiContent{
 			Parts: []GeminiPart{{Text: text}},
 		},
+		OutputDimensionality: 768, // 👉 Force compression to 768 dimensions for Qdrant compatibility
 	})
 
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=%s", s.apiKey)
+	// 👉 Updated to the new gemini-embedding-2 model
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent?key=%s", s.apiKey)
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(embReq))
 	if err != nil {
 		return nil, err
