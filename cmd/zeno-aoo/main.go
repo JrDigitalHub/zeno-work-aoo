@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -120,20 +121,62 @@ func main() {
 	go wsEngine.Run()                // Boot the thread state loop
 	router.Subscribe(wsEngine.React) // Bind it to intercept discovery/email events
 
-	// Expose the WebSocket channel to incoming local connections
+	// 8. Initialize Discovery Agent
+	discoveryAgent := agent.NewDiscoveryAgent(router, relationalBrain)
+
+	// 👉 Expose the WebSocket channel safely for Render
 	http.Handle("/ws", wsEngine)
+
+	// 👉 NEW: The CEO Directive API Endpoint
+	http.HandleFunc("/api/directive", func(w http.ResponseWriter, r *http.Request) {
+		// 1. Configure CORS to allow your Next.js dashboard to communicate securely
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		// Handle preflight requests
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// 2. Extract the target command from the JSON payload
+		var req struct {
+			Target string `json:"target"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Target == "" {
+			http.Error(w, "Invalid payload structure.", http.StatusBadRequest)
+			return
+		}
+
+		fmt.Printf("\n⚡ [API] Manual CEO Directive Received: '%s'. Rerouting Discovery Engine...\n", req.Target)
+
+		// 3. Fire the Discovery Agent asynchronously without blocking the server
+		go discoveryAgent.ExtractLeads(req.Target)
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "Directive Engaged", "target": req.Target})
+	})
+
+	// Boot the HTTP/Websocket Server
 	go func() {
-		fmt.Println("🌐 [HTTP] Streaming state socket initialized on: ws://localhost:8080/ws")
-		if err := http.ListenAndServe(":8080", nil); err != nil {
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080" // Fallback for local testing
+		}
+		fmt.Printf("🌐 [HTTP] Streaming state socket & API listening on port: %s\n", port)
+
+		// Render requires listening on 0.0.0.0
+		if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
 			fmt.Printf("❌ CRITICAL: Server tracking socket runtime crash: %v\n", err)
 		}
 	}()
 
-	// 8. Deploy Pipeline
-	discoveryAgent := agent.NewDiscoveryAgent(router, relationalBrain) // 👉 Pass it in here!
+	// 9. Deploy Initial Autonomous Pipeline
 	go discoveryAgent.ExtractLeads(searchQuery)
 
 	// Sleep timer explicitly set to 180 seconds to allow all LLM execution
+	// NOTE: In the future, if you want this server running 24/7 forever, we will swap this sleep timer for a blank `select {}` block!
 	time.Sleep(180 * time.Second)
 	fmt.Println("\n🛑 [SYSTEM] Execution lifecycle complete. Powering down.")
 }
