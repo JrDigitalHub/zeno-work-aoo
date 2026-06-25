@@ -5,10 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"strings"
-	"time"
+	"sync"
 
-	"github.com/joho/godotenv" // Added godotenv to securely load your secrets
+	"github.com/joho/godotenv" // Securely load your secrets
 
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/agent"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/backoffice"
@@ -18,18 +17,18 @@ import (
 	"github.com/JrDigitalHub/zeno-work-aoo/pkg/protocol"
 )
 
+// 👉 Global Master Kill Switch State
+var (
+	systemStatusMutex sync.RWMutex
+	isSystemActive    bool = true // Defaults to ONLINE at boot
+)
+
 func main() {
-	// Look for this specific header to confirm the Oracle is injected!
 	fmt.Println("🧠 Zeno OS: Booting Unified Neural Infrastructure [Graph + Vector + Relational + Back-Office + Oracle]...")
 
 	// 👉 SECURE VAULT INIT: Load environment variables from your local .env file
 	if err := godotenv.Load(); err != nil {
 		fmt.Println("⚠️  No .env file found, relying on system environment variables.")
-	}
-
-	searchQuery := "Hardware automation startups"
-	if len(os.Args) > 1 {
-		searchQuery = strings.Join(os.Args[1:], " ")
 	}
 
 	// 1. Ignite Neo4j (NOW CLOUD READY)
@@ -81,8 +80,8 @@ func main() {
 		defer relationalBrain.Close()
 	}
 
-	// 3. Initialize Back-Office
-	opsManager := backoffice.NewManager(3)
+	// 3. Initialize Back-Office (Enterprise Multi-Tenant Mode)
+	opsManager := backoffice.NewManager(10, 3)
 
 	// 4. Ignite Router
 	router := orchestrator.NewEventRouter()
@@ -108,9 +107,9 @@ func main() {
 		"smtp.zoho.com",
 		"465",
 		"system@jrdigitalhubltd.com",
-		os.Getenv("ZOHO_SYSTEM_PASSWORD"), // Now safely grabbing from .env
+		os.Getenv("ZOHO_SYSTEM_PASSWORD"),
 		"JR Digital Hub | System",
-		relationalBrain, // 👉 INJECT THE SUPABASE CONNECTION HERE
+		relationalBrain,
 	)
 	router.Subscribe(func(event protocol.Event) {
 		emailEngine.React(event)
@@ -118,65 +117,135 @@ func main() {
 
 	// 7.7. Initialize Real-Time WebSocket State Engine
 	wsEngine := comms.NewWebSocketEngine()
-	go wsEngine.Run()                // Boot the thread state loop
-	router.Subscribe(wsEngine.React) // Bind it to intercept discovery/email events
+	go wsEngine.Run()
+	router.Subscribe(wsEngine.React)
 
 	// 8. Initialize Discovery Agent
 	discoveryAgent := agent.NewDiscoveryAgent(router, relationalBrain)
 
+	// 8.5 Initialize Financial Modeler
+	modelerAgent := agent.NewFinancialModeler(router, relationalBrain)
+	router.Subscribe(modelerAgent.React)
+
+	// --- ENTERPRISE HTTP ROUTING --- //
+
 	// 👉 Expose the WebSocket channel safely for Render
 	http.Handle("/ws", wsEngine)
 
-	// 👉 NEW: The CEO Directive API Endpoint
-	http.HandleFunc("/api/directive", func(w http.ResponseWriter, r *http.Request) {
-		// 1. Configure CORS to allow your Next.js dashboard to communicate securely
+	// 👉 API Master Kill Switch (Protects API Credits)
+	http.HandleFunc("/api/v1/system/toggle", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-		// Handle preflight requests
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		// 2. Extract the target command from the JSON payload
 		var req struct {
-			Target string `json:"target"`
+			State string `json:"state"` // "ACTIVE" or "STANDBY"
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Target == "" {
-			http.Error(w, "Invalid payload structure.", http.StatusBadRequest)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid payload", http.StatusBadRequest)
 			return
 		}
 
-		fmt.Printf("\n⚡ [API] Manual CEO Directive Received: '%s'. Rerouting Discovery Engine...\n", req.Target)
-
-		// 3. Fire the Discovery Agent asynchronously without blocking the server
-		go discoveryAgent.ExtractLeads(req.Target)
+		systemStatusMutex.Lock()
+		if req.State == "STANDBY" {
+			isSystemActive = false
+			fmt.Println("🛑 [SYSTEM] Master Kill Switch Engaged. ZENO OS is now in STANDBY.")
+		} else {
+			isSystemActive = true
+			fmt.Println("🟢 [SYSTEM] Systems Online. ZENO OS is now ACTIVE.")
+		}
+		systemStatusMutex.Unlock()
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "Directive Engaged", "target": req.Target})
+		json.NewEncoder(w).Encode(map[string]string{"status": "Acknowledged", "current_state": req.State})
+	})
+
+	// 👉 The CEO Directive API Endpoint (Multi-Tenant + Protected)
+	http.HandleFunc("/api/directive", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// 1. Check Kill Switch
+		systemStatusMutex.RLock()
+		active := isSystemActive
+		systemStatusMutex.RUnlock()
+		if !active {
+			http.Error(w, `{"error": "ZENO is in STANDBY mode. Toggle system to ACTIVE to proceed."}`, http.StatusServiceUnavailable)
+			return
+		}
+
+		// 2. Extract payload
+		var req struct {
+			WorkspaceID string `json:"workspace_id"`
+			Target      string `json:"target"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Target == "" || req.WorkspaceID == "" {
+			http.Error(w, "Invalid payload. 'workspace_id' and 'target' required.", http.StatusBadRequest)
+			return
+		}
+
+		fmt.Printf("\n⚡ [API] Directive Received for Workspace [%s]: '%s'. Rerouting...\n", req.WorkspaceID, req.Target)
+
+		// 👉 FIXED: Now correctly passing BOTH WorkspaceID and Target
+		go discoveryAgent.ExtractLeads(req.WorkspaceID, req.Target)
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "Directive Engaged", "workspace_id": req.WorkspaceID})
+	})
+
+	// 👉 Back-Office Ingestion Webhook (The Invisible COO's Ear)
+	http.HandleFunc("/api/v1/ingest", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		var req struct {
+			WorkspaceID string `json:"workspace_id"`
+			Source      string `json:"source"`
+			Payload     string `json:"payload"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.WorkspaceID == "" || req.Payload == "" {
+			http.Error(w, "Invalid payload. 'workspace_id', 'source', and 'payload' required.", http.StatusBadRequest)
+			return
+		}
+
+		opsManager.Ingest(req.WorkspaceID, req.Source, req.Payload)
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "ZENO_ACKNOWLEDGED", "workspace_id": req.WorkspaceID})
 	})
 
 	// Boot the HTTP/Websocket Server
 	go func() {
 		port := os.Getenv("PORT")
 		if port == "" {
-			port = "8080" // Fallback for local testing
+			port = "8080"
 		}
 		fmt.Printf("🌐 [HTTP] Streaming state socket & API listening on port: %s\n", port)
 
-		// Render requires listening on 0.0.0.0
 		if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
 			fmt.Printf("❌ CRITICAL: Server tracking socket runtime crash: %v\n", err)
 		}
 	}()
 
-	// 9. Deploy Initial Autonomous Pipeline
-	go discoveryAgent.ExtractLeads(searchQuery)
+	fmt.Println("\n🛡️  [SYSTEM] ZENO Backend Online. Waiting for client directives...")
 
-	// Sleep timer explicitly set to 180 seconds to allow all LLM execution
-	// NOTE: In the future, if you want this server running 24/7 forever, we will swap this sleep timer for a blank `select {}` block!
-	time.Sleep(180 * time.Second)
-	fmt.Println("\n🛑 [SYSTEM] Execution lifecycle complete. Powering down.")
+	// Server runs 24/7 now.
+	select {}
 }

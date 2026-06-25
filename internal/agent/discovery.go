@@ -33,9 +33,9 @@ type AlgoliaResponse struct {
 	} `json:"hits"`
 }
 
-// ExtractLeads initiates a live API scan bypassing HTML bot-blockers
-func (d *DiscoveryAgent) ExtractLeads(query string) {
-	fmt.Printf("🔍 [DISCOVERY] Live API Hunt Initiated. Target Sector: \"%s\"\n", query)
+// ExtractLeads initiates a live API scan bypassing HTML bot-blockers, completely isolated by WorkspaceID
+func (d *DiscoveryAgent) ExtractLeads(workspaceID string, query string) {
+	fmt.Printf("🔍 [DISCOVERY] Live API Hunt Initiated for Workspace [%s]. Target Sector: \"%s\"\n", workspaceID, query)
 	fmt.Println("🔍 [DISCOVERY] Bypassing HTML walls. Tapping into Hacker News Algolia JSON interface...")
 
 	// Encode the query and hit the API
@@ -44,14 +44,14 @@ func (d *DiscoveryAgent) ExtractLeads(query string) {
 
 	resp, err := http.Get(apiURL)
 	if err != nil {
-		fmt.Printf("❌ [DISCOVERY] API grid offline: %v\n", err)
+		fmt.Printf("❌ [DISCOVERY] API grid offline for [%s]: %v\n", workspaceID, err)
 		return
 	}
 	defer resp.Body.Close()
 
 	var result AlgoliaResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		fmt.Printf("❌ [DISCOVERY] Failed to decode telemetry: %v\n", err)
+		fmt.Printf("❌ [DISCOVERY] Failed to decode telemetry for [%s]: %v\n", workspaceID, err)
 		return
 	}
 
@@ -82,17 +82,18 @@ func (d *DiscoveryAgent) ExtractLeads(query string) {
 		}
 	}
 
-	fmt.Printf("✅ [DISCOVERY] Live API scan complete. Acquired %d fresh target coordinates.\n", len(finalTargets))
+	fmt.Printf("✅ [DISCOVERY] Live API scan complete for Workspace [%s]. Acquired %d fresh target coordinates.\n", workspaceID, len(finalTargets))
 
 	// Stream the live targets into the ZENO Neural Bus
 	for _, target := range finalTargets {
-		fmt.Printf("📡 [DISCOVERY] Streaming live target to router: %s\n", target)
+		fmt.Printf("📡 [DISCOVERY] Streaming live target to router for [%s]: %s\n", workspaceID, target)
 
 		d.router.Publish(protocol.Event{
-			ID:        target,
-			Source:    "DISCOVERY",
-			Payload:   target,
-			Timestamp: time.Now().Unix(),
+			WorkspaceID: workspaceID, // 👉 CRITICAL: This ensures downstream agents know who owns this lead
+			ID:          target,
+			Source:      "DISCOVERY",
+			Payload:     target,
+			Timestamp:   time.Now().Unix(),
 		})
 
 		time.Sleep(1 * time.Second)

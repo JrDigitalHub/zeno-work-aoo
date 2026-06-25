@@ -68,21 +68,22 @@ type GeminiEmbeddingResponse struct {
 func (s *Sentinel) React(e protocol.Event) {
 	if e.Source == "PREDATOR" {
 		// 1. Relational sanity check using Neo4j
+		// Note: In a fully scaled DB, you will eventually want to index this Recall by WorkspaceID + ID
 		if _, exists := s.graphStore.Recall(e.ID); exists {
 			fmt.Printf("🛡️ [SENTINEL] Graph memory confirms target [%s] was already processed. Aborting duplicate operation.\n", e.ID)
 			return
 		}
 
-		// 2. Back-Office Capacity Check
-		if !s.backOffice.CheckCapacity() {
-			fmt.Printf("⛔ [SENTINEL] Back-Office rejected workflow for [%s]: Internal capacity maxed out.\n", e.ID)
+		// 2. Back-Office Capacity Check (👉 NOW ISOLATED BY WORKSPACE)
+		if !s.backOffice.CheckCapacity(e.WorkspaceID) {
+			fmt.Printf("⛔ [SENTINEL] Back-Office rejected workflow for Workspace [%s] Target [%s]: Internal capacity maxed out.\n", e.WorkspaceID, e.ID)
 			return
 		}
 
-		// 3. Immediately reserve the pipeline slot so concurrent subpages don't flood the system
-		s.backOffice.RegisterPipeline(e.ID)
+		// 3. Immediately reserve the pipeline slot so concurrent subpages don't flood the system (👉 NOW ISOLATED)
+		s.backOffice.RegisterPipeline(e.WorkspaceID, e.ID)
 
-		fmt.Printf("\n⚙️ [SENTINEL] Processing New Context! Target ID: %s\n", e.ID)
+		fmt.Printf("\n⚙️ [SENTINEL] Processing New Context! Workspace: [%s] Target ID: %s\n", e.WorkspaceID, e.ID)
 
 		// Check for API Key presence
 		if s.apiKey == "" {
@@ -100,8 +101,9 @@ func (s *Sentinel) React(e protocol.Event) {
 
 		// 5. Anchoring semantic truth in Qdrant Vector database
 		metadata := map[string]any{
-			"url":       e.ID,
-			"timestamp": e.Timestamp,
+			"workspace_id": e.WorkspaceID, // 👉 Enterprise isolation tag
+			"url":          e.ID,
+			"timestamp":    e.Timestamp,
 		}
 		err = s.vectorStore.UpsertVector(e.ID, vector, metadata)
 		if err != nil {
@@ -158,21 +160,22 @@ func (s *Sentinel) React(e protocol.Event) {
 			return
 		}
 
-		fmt.Printf("\n✅ [SENTINEL] Sovereign Intelligence Generated:\n\n%s\n\n", responseText)
+		fmt.Printf("\n✅ [SENTINEL] Sovereign Intelligence Generated for [%s]:\n\n%s\n\n", e.WorkspaceID, responseText)
 
 		// 7. Anchor relationship data in Neo4j Graph
 		s.graphStore.Save(protocol.MemoryNode{
 			EntityID:   e.ID,
 			EntityType: "PROSPECT",
-			Context:    "Strategic summary processed.",
+			Context:    fmt.Sprintf("[Workspace: %s] Strategic summary processed.", e.WorkspaceID), // 👉 Tagged context
 		})
 
 		// 8. Broadcast output event onto bus
 		s.router.Publish(protocol.Event{
-			ID:        e.ID,
-			Source:    "SENTINEL_TEXT_OUTPUT",
-			Payload:   responseText,
-			Timestamp: time.Now().Unix(),
+			WorkspaceID: e.WorkspaceID, // 👉 Critical: Passes ownership to the outbound Email engine
+			ID:          e.ID,
+			Source:      "SENTINEL_TEXT_OUTPUT",
+			Payload:     responseText,
+			Timestamp:   time.Now().Unix(),
 		})
 	}
 }
