@@ -1,10 +1,12 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
-	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -15,41 +17,61 @@ import (
 
 type DiscoveryAgent struct {
 	router *orchestrator.EventRouter
-	DB     *memory.RelationalStore // 👉 Injected the database so it matches main.go
+	DB     *memory.RelationalStore
+	apiKey string
 }
 
-// Updated to accept the database connection during boot
 func NewDiscoveryAgent(r *orchestrator.EventRouter, db *memory.RelationalStore) *DiscoveryAgent {
 	return &DiscoveryAgent{
 		router: r,
 		DB:     db,
+		apiKey: os.Getenv("SERPER_API_KEY"), // 👉 Now securely loading a real Web Search API key
 	}
 }
 
-// AlgoliaResponse maps the JSON structure returned by the Hacker News API
-type AlgoliaResponse struct {
-	Hits []struct {
-		URL string `json:"url"`
-	} `json:"hits"`
+// SerperResponse maps the JSON structure returned by the Google Search API wrapper
+type SerperResponse struct {
+	Organic []struct {
+		Title string `json:"title"`
+		Link  string `json:"link"`
+	} `json:"organic"`
 }
 
-// ExtractLeads initiates a live API scan bypassing HTML bot-blockers, completely isolated by WorkspaceID
+// ExtractLeads initiates a global web search, completely isolated by WorkspaceID
 func (d *DiscoveryAgent) ExtractLeads(workspaceID string, query string) {
-	fmt.Printf("🔍 [DISCOVERY] Live API Hunt Initiated for Workspace [%s]. Target Sector: \"%s\"\n", workspaceID, query)
-	fmt.Println("🔍 [DISCOVERY] Bypassing HTML walls. Tapping into Hacker News Algolia JSON interface...")
+	fmt.Printf("🔍 [DISCOVERY] Global Web Hunt Initiated for Workspace [%s]. Target: \"%s\"\n", workspaceID, query)
 
-	// Encode the query and hit the API
-	encodedQuery := url.QueryEscape(query)
-	apiURL := fmt.Sprintf("https://hn.algolia.com/api/v1/search?query=%s&tags=story", encodedQuery)
+	if d.apiKey == "" {
+		fmt.Printf("❌ [DISCOVERY] API grid offline for [%s]: SERPER_API_KEY environment variable is empty.\n", workspaceID)
+		return
+	}
 
-	resp, err := http.Get(apiURL)
+	// 1. Configure the Google Search Payload
+	payload := map[string]interface{}{
+		"q":   query,
+		"num": 20, // Fetch top 20 organic results to filter down
+	}
+	jsonPayload, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequest("POST", "https://google.serper.dev/search", bytes.NewBuffer(jsonPayload))
+	req.Header.Add("X-API-KEY", d.apiKey)
+	req.Header.Add("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("❌ [DISCOVERY] API grid offline for [%s]: %v\n", workspaceID, err)
+		fmt.Printf("❌ [DISCOVERY] Search grid offline for [%s]: %v\n", workspaceID, err)
 		return
 	}
 	defer resp.Body.Close()
 
-	var result AlgoliaResponse
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		fmt.Printf("❌ [DISCOVERY] Search engine rejected query for [%s]. Status: %d, Response: %s\n", workspaceID, resp.StatusCode, string(body))
+		return
+	}
+
+	var result SerperResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		fmt.Printf("❌ [DISCOVERY] Failed to decode telemetry for [%s]: %v\n", workspaceID, err)
 		return
@@ -58,38 +80,45 @@ func (d *DiscoveryAgent) ExtractLeads(workspaceID string, query string) {
 	uniqueTargets := make(map[string]bool)
 	var finalTargets []string
 
-	// Filter and validate the raw URLs
-	for _, hit := range result.Hits {
-		link := hit.URL
-		if link != "" &&
-			strings.HasPrefix(link, "http") &&
-			!strings.Contains(link, "ycombinator.com") &&
-			!strings.Contains(link, "github.com") &&
-			!strings.Contains(link, "medium.com") &&
-			!strings.Contains(link, "nytimes.com") &&
-			!strings.Contains(link, "youtube.com") {
+	// 2. Enterprise Domain Filtering
+	for _, hit := range result.Organic {
+		link := hit.Link
+		if link != "" && strings.HasPrefix(link, "http") {
 
-			if !uniqueTargets[link] {
-				// Note: Since this agent only handles URLs right now, we rely on the
-				// downstream EmailEngine to check if the target's EMAIL exists in the DB before sending!
-				uniqueTargets[link] = true
-				finalTargets = append(finalTargets, link)
+			// 👉 Filter out massive aggregators, social media, and junk directories
+			lowerLink := strings.ToLower(link)
+			if !strings.Contains(lowerLink, "ycombinator.com") &&
+				!strings.Contains(lowerLink, "github.com") &&
+				!strings.Contains(lowerLink, "medium.com") &&
+				!strings.Contains(lowerLink, "nytimes.com") &&
+				!strings.Contains(lowerLink, "youtube.com") &&
+				!strings.Contains(lowerLink, "linkedin.com") &&
+				!strings.Contains(lowerLink, "facebook.com") &&
+				!strings.Contains(lowerLink, "twitter.com") &&
+				!strings.Contains(lowerLink, "yelp.com") &&
+				!strings.Contains(lowerLink, "clutch.co") {
+
+				if !uniqueTargets[link] {
+					uniqueTargets[link] = true
+					finalTargets = append(finalTargets, link)
+				}
 			}
 		}
 
-		if len(finalTargets) >= 4 {
+		// Cap the pipeline at 5 high-quality, direct company domains per sweep to protect resources
+		if len(finalTargets) >= 5 {
 			break
 		}
 	}
 
-	fmt.Printf("✅ [DISCOVERY] Live API scan complete for Workspace [%s]. Acquired %d fresh target coordinates.\n", workspaceID, len(finalTargets))
+	fmt.Printf("✅ [DISCOVERY] Global scan complete for Workspace [%s]. Acquired %d fresh target coordinates.\n", workspaceID, len(finalTargets))
 
-	// Stream the live targets into the ZENO Neural Bus
+	// 3. Stream the live targets into the ZENO Neural Bus
 	for _, target := range finalTargets {
-		fmt.Printf("📡 [DISCOVERY] Streaming live target to router for [%s]: %s\n", workspaceID, target)
+		fmt.Printf("📡 [DISCOVERY] Streaming target to Predator routing for [%s]: %s\n", workspaceID, target)
 
 		d.router.Publish(protocol.Event{
-			WorkspaceID: workspaceID, // 👉 CRITICAL: This ensures downstream agents know who owns this lead
+			WorkspaceID: workspaceID,
 			ID:          target,
 			Source:      "DISCOVERY",
 			Payload:     target,
