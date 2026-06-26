@@ -132,7 +132,7 @@ func main() {
 	// 👉 Expose the WebSocket channel safely for Render
 	http.Handle("/ws", wsEngine)
 
-	// 👉 API Master Kill Switch (Protects API Credits)
+	// 👉 API Master Kill Switch (Protects API Credits Globally)
 	http.HandleFunc("/api/v1/system/toggle", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
@@ -163,6 +163,49 @@ func main() {
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "Acknowledged", "current_state": req.State})
+	})
+
+	// 👉 Client Workspace Campaign Toggle (Pause/Resume Client-Specific Pipeline)
+	http.HandleFunc("/api/v1/workspace/toggle", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		var req struct {
+			WorkspaceID string `json:"workspace_id"`
+			IsPaused    bool   `json:"is_paused"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.WorkspaceID == "" {
+			http.Error(w, "Invalid payload. 'workspace_id' and 'is_paused' status required.", http.StatusBadRequest)
+			return
+		}
+
+		if relationalBrain == nil {
+			http.Error(w, "Relational Store storage subsystem offline.", http.StatusServiceUnavailable)
+			return
+		}
+
+		// Update the specific workspace status dynamically inside Supabase Postgres
+		_, err := relationalBrain.DB.Exec("UPDATE workspaces SET is_paused = $1 WHERE id = $2", req.IsPaused, req.WorkspaceID)
+		if err != nil {
+			fmt.Printf("❌ [SYSTEM] Database workspace toggle crash: %v\n", err)
+			http.Error(w, "Database runtime transaction failed.", http.StatusInternalServerError)
+			return
+		}
+
+		stateMsg := "ACTIVE"
+		if req.IsPaused {
+			stateMsg = "PAUSED"
+		}
+		fmt.Printf("⏸️  [SYSTEM] Workspace [%s] campaign status updated to: %s\n", req.WorkspaceID, stateMsg)
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "Acknowledged", "workspace_state": stateMsg, "workspace_id": req.WorkspaceID})
 	})
 
 	// 👉 The CEO Directive API Endpoint (Multi-Tenant + Protected)

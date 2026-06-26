@@ -60,7 +60,7 @@ func NewEmailEngine(server, port, username, password, senderName string, db *mem
 	}
 }
 
-// 👉 NEW: Dynamic Enterprise Routing Logic
+// 👉 Dynamic Enterprise Routing Logic
 // Fetches the specific client's SMTP credentials from Supabase. Falls back to JR Digital Hub system default.
 func (e *EmailEngine) getClientSMTP(workspaceID string) (server, port, user, pass, sender string) {
 	// TODO: Replace with actual Supabase DB query -> e.DB.Query(...) using workspaceID
@@ -112,7 +112,7 @@ func (e *EmailEngine) QualifyTarget(company TargetCompany) QualificationResult {
 	}
 }
 
-// 👉 UPDATED: Now requires WorkspaceID to dynamically route the email
+// Now requires WorkspaceID to dynamically route the email
 func (e *EmailEngine) SendOutbound(workspaceID, to, subject, htmlBody string) error {
 	// Dynamically pull the correct email credentials for the client
 	server, port, user, pass, senderName := e.getClientSMTP(workspaceID)
@@ -177,7 +177,7 @@ func (e *EmailEngine) React(event interface{}) {
 	// Inspect incoming broad structural events passing through the hub using a type switch
 	switch ev := event.(type) {
 
-	// 👉 NEW: Bridge the gap for the universal protocol.Event coming from Sentinel
+	// Bridge the gap for the universal protocol.Event coming from Sentinel
 	case protocol.Event:
 		if ev.Source == "SENTINEL_TEXT_OUTPUT" {
 			fmt.Printf("✉️ [EmailEngine] Intercepted protocol.Event for Workspace [%s]. Transforming to Outbound Payload...\n", ev.WorkspaceID)
@@ -216,6 +216,18 @@ func (e *EmailEngine) React(event interface{}) {
 
 	case OutboundEmailPayload:
 		fmt.Printf("✉️ [EmailEngine] Intercepted outbound execution task targeting: %s for Workspace [%s]\n", ev.Target.Email, ev.WorkspaceID)
+
+		// 👉 NEW: The Absolute Pause Campaign Check
+		// We query Supabase to ensure the client hasn't paused their operations.
+		if e.DB != nil && e.DB.DB != nil {
+			var isPaused bool
+			// We execute a single row scan to extract the boolean.
+			err := e.DB.DB.QueryRow("SELECT is_paused FROM workspaces WHERE id = $1", ev.WorkspaceID).Scan(&isPaused)
+			if err == nil && isPaused {
+				fmt.Printf("⏸️ [EmailEngine] Workspace [%s] is PAUSED. Retaining draft in system and aborting SMTP dispatch.\n", ev.WorkspaceID)
+				return
+			}
+		}
 
 		// Run a secondary qualification check immediately before actual delivery to verify state safety
 		assessment := e.QualifyTarget(ev.Target)
