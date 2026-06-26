@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -25,31 +24,103 @@ func NewDiscoveryAgent(r *orchestrator.EventRouter, db *memory.RelationalStore) 
 	return &DiscoveryAgent{
 		router: r,
 		DB:     db,
-		apiKey: os.Getenv("SERPER_API_KEY"), // 👉 Now securely loading a real Web Search API key
+		apiKey: os.Getenv("SERPER_API_KEY"),
 	}
 }
 
-// SerperResponse maps the JSON structure returned by the Google Search API wrapper
-type SerperResponse struct {
+// Structs for parsing different Serper API responses
+type SerperPlacesResponse struct {
+	Places []struct {
+		Title       string `json:"title"`
+		Address     string `json:"address"`
+		PhoneNumber string `json:"phoneNumber"`
+		Website     string `json:"website"`
+	} `json:"places"`
+}
+
+type SerperOrganicResponse struct {
 	Organic []struct {
-		Title string `json:"title"`
-		Link  string `json:"link"`
+		Title   string `json:"title"`
+		Link    string `json:"link"`
+		Snippet string `json:"snippet"`
 	} `json:"organic"`
 }
 
-// ExtractLeads initiates a global web search, completely isolated by WorkspaceID
-func (d *DiscoveryAgent) ExtractLeads(workspaceID string, query string) {
-	fmt.Printf("🔍 [DISCOVERY] Global Web Hunt Initiated for Workspace [%s]. Target: \"%s\"\n", workspaceID, query)
-
+// 👉 The Master Routing Hub
+// We now pass a 'mode' string to dictate the hunting strategy
+func (d *DiscoveryAgent) ExtractLeads(workspaceID string, query string, mode string) {
 	if d.apiKey == "" {
-		fmt.Printf("❌ [DISCOVERY] API grid offline for [%s]: SERPER_API_KEY environment variable is empty.\n", workspaceID)
+		fmt.Printf("❌ [DISCOVERY] API grid offline for [%s]: SERPER_API_KEY missing.\n", workspaceID)
 		return
 	}
 
-	// 1. Configure the Google Search Payload
+	switch mode {
+	case "SOCIAL_HUNTER":
+		d.runSocialHunter(workspaceID, query)
+	case "DEEP_CRAWLER":
+		d.runDeepCrawler(workspaceID, query)
+	case "LOCAL_SCANNER":
+		fallthrough
+	default:
+		d.runLocalScanner(workspaceID, query)
+	}
+}
+
+// ---------------------------------------------------------
+// VECTOR 1: LOCAL GRID SCANNER (Physical SMEs)
+// ---------------------------------------------------------
+func (d *DiscoveryAgent) runLocalScanner(workspaceID, query string) {
+	fmt.Printf("📍 [DISCOVERY] Local Grid Scanner Engaged. Target: \"%s\"\n", query)
+
+	payload := map[string]interface{}{"q": query}
+	jsonPayload, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequest("POST", "https://google.serper.dev/places", bytes.NewBuffer(jsonPayload))
+	req.Header.Add("X-API-KEY", d.apiKey)
+	req.Header.Add("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		fmt.Printf("❌ [DISCOVERY] Local Scanner failed: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var result SerperPlacesResponse
+	json.NewDecoder(resp.Body).Decode(&result)
+
+	count := 0
+	for _, hit := range result.Places {
+		if hit.Website != "" && strings.HasPrefix(hit.Website, "http") {
+			enrichedPayload := fmt.Sprintf("COMPANY: %s | WEBSITE: %s | PHONE: %s", hit.Title, hit.Website, hit.PhoneNumber)
+			
+			d.router.Publish(protocol.Event{
+				WorkspaceID: workspaceID,
+				ID:          hit.Website,
+				Source:      "DISCOVERY",
+				Payload:     enrichedPayload,
+				Timestamp:   time.Now().Unix(),
+			})
+			count++
+			time.Sleep(500 * time.Millisecond) // Throttled transmission
+		}
+		if count >= 10 { break }
+	}
+	fmt.Printf("✅ [DISCOVERY] Local scan complete. Acquired %d targets.\n", count)
+}
+
+// ---------------------------------------------------------
+// VECTOR 2: X-RAY SOCIAL HUNTER (Individuals / LinkedIn)
+// ---------------------------------------------------------
+func (d *DiscoveryAgent) runSocialHunter(workspaceID, query string) {
+	// 👉 Advanced Google Dorking: Force Serper to only return LinkedIn profiles of founders
+	dorkQuery := fmt.Sprintf("site:linkedin.com/in/ \"Founder\" OR \"CEO\" %s", query)
+	fmt.Printf("👤 [DISCOVERY] X-Ray Social Hunter Engaged. Dorking: \"%s\"\n", dorkQuery)
+
 	payload := map[string]interface{}{
-		"q":   query,
-		"num": 20, // Fetch top 20 organic results to filter down
+		"q":   dorkQuery,
+		"num": 10,
 	}
 	jsonPayload, _ := json.Marshal(payload)
 
@@ -59,72 +130,99 @@ func (d *DiscoveryAgent) ExtractLeads(workspaceID string, query string) {
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Printf("❌ [DISCOVERY] Search grid offline for [%s]: %v\n", workspaceID, err)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		fmt.Printf("❌ [DISCOVERY] Social Hunter failed: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		fmt.Printf("❌ [DISCOVERY] Search engine rejected query for [%s]. Status: %d, Response: %s\n", workspaceID, resp.StatusCode, string(body))
-		return
-	}
+	var result SerperOrganicResponse
+	json.NewDecoder(resp.Body).Decode(&result)
 
-	var result SerperResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		fmt.Printf("❌ [DISCOVERY] Failed to decode telemetry for [%s]: %v\n", workspaceID, err)
+	count := 0
+	for _, hit := range result.Organic {
+		if strings.Contains(hit.Link, "linkedin.com/in/") {
+			// Clean the title (usually looks like "John Doe - Founder - Acme Corp | LinkedIn")
+			cleanTitle := strings.Split(hit.Title, " | ")[0]
+			enrichedPayload := fmt.Sprintf("PERSON: %s | URL: %s | BIO: %s", cleanTitle, hit.Link, hit.Snippet)
+
+			d.router.Publish(protocol.Event{
+				WorkspaceID: workspaceID,
+				ID:          hit.Link,
+				Source:      "DISCOVERY",
+				Payload:     enrichedPayload,
+				Timestamp:   time.Now().Unix(),
+			})
+			count++
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	fmt.Printf("✅ [DISCOVERY] X-Ray scan complete. Acquired %d key decision makers.\n", count)
+}
+
+// ---------------------------------------------------------
+// VECTOR 3: DEEP-WATER CRAWLER (Struggling B2B Companies)
+// ---------------------------------------------------------
+func (d *DiscoveryAgent) runDeepCrawler(workspaceID, query string) {
+	fmt.Printf("🌊 [DISCOVERY] Deep-Water Crawler Engaged. Target: \"%s\"\n", query)
+
+	// 👉 The Pagination Trick: We skip the top 30 results (Pages 1-3) to bypass SEO giants
+	payload := map[string]interface{}{
+		"q":    query,
+		"page": 4,  // Start on page 4
+		"num":  20, // Grab 20 results
+	}
+	jsonPayload, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequest("POST", "https://google.serper.dev/search", bytes.NewBuffer(jsonPayload))
+	req.Header.Add("X-API-KEY", d.apiKey)
+	req.Header.Add("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		fmt.Printf("❌ [DISCOVERY] Deep Crawler failed: %v\n", err)
 		return
 	}
+	defer resp.Body.Close()
+
+	var result SerperOrganicResponse
+	json.NewDecoder(resp.Body).Decode(&result)
 
 	uniqueTargets := make(map[string]bool)
-	var finalTargets []string
+	count := 0
 
-	// 2. Enterprise Domain Filtering
 	for _, hit := range result.Organic {
 		link := hit.Link
 		if link != "" && strings.HasPrefix(link, "http") {
-
-			// 👉 Filter out massive aggregators, social media, and junk directories
 			lowerLink := strings.ToLower(link)
+			
+			// Aggressive filtering: We only want independent company domains
 			if !strings.Contains(lowerLink, "ycombinator.com") &&
-				!strings.Contains(lowerLink, "github.com") &&
-				!strings.Contains(lowerLink, "medium.com") &&
-				!strings.Contains(lowerLink, "nytimes.com") &&
-				!strings.Contains(lowerLink, "youtube.com") &&
 				!strings.Contains(lowerLink, "linkedin.com") &&
 				!strings.Contains(lowerLink, "facebook.com") &&
-				!strings.Contains(lowerLink, "twitter.com") &&
+				!strings.Contains(lowerLink, "clutch.co") &&
 				!strings.Contains(lowerLink, "yelp.com") &&
-				!strings.Contains(lowerLink, "clutch.co") {
+				!strings.Contains(lowerLink, "medium.com") {
 
 				if !uniqueTargets[link] {
 					uniqueTargets[link] = true
-					finalTargets = append(finalTargets, link)
+					
+					enrichedPayload := fmt.Sprintf("COMPANY: %s | WEBSITE: %s | CONTEXT: %s", hit.Title, link, hit.Snippet)
+					
+					d.router.Publish(protocol.Event{
+						WorkspaceID: workspaceID,
+						ID:          link,
+						Source:      "DISCOVERY",
+						Payload:     enrichedPayload,
+						Timestamp:   time.Now().Unix(),
+					})
+					count++
+					time.Sleep(500 * time.Millisecond)
 				}
 			}
 		}
-
-		// Cap the pipeline at 5 high-quality, direct company domains per sweep to protect resources
-		if len(finalTargets) >= 5 {
-			break
-		}
+		if count >= 10 { break }
 	}
-
-	fmt.Printf("✅ [DISCOVERY] Global scan complete for Workspace [%s]. Acquired %d fresh target coordinates.\n", workspaceID, len(finalTargets))
-
-	// 3. Stream the live targets into the ZENO Neural Bus
-	for _, target := range finalTargets {
-		fmt.Printf("📡 [DISCOVERY] Streaming target to Predator routing for [%s]: %s\n", workspaceID, target)
-
-		d.router.Publish(protocol.Event{
-			WorkspaceID: workspaceID,
-			ID:          target,
-			Source:      "DISCOVERY",
-			Payload:     target,
-			Timestamp:   time.Now().Unix(),
-		})
-
-		time.Sleep(1 * time.Second)
-	}
+	fmt.Printf("✅ [DISCOVERY] Deep-Water crawl complete. Acquired %d low-visibility SME domains.\n", count)
 }

@@ -228,23 +228,29 @@ func main() {
 			return
 		}
 
-		// 2. Extract payload
+		// 2. Extract payload (Now includes 'mode' for multi-vector hunting)
 		var req struct {
 			WorkspaceID string `json:"workspace_id"`
 			Target      string `json:"target"`
+			Mode        string `json:"mode"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Target == "" || req.WorkspaceID == "" {
 			http.Error(w, "Invalid payload. 'workspace_id' and 'target' required.", http.StatusBadRequest)
 			return
 		}
 
-		fmt.Printf("\n⚡ [API] Directive Received for Workspace [%s]: '%s'. Rerouting...\n", req.WorkspaceID, req.Target)
+		// Set a default mode if the UI doesn't provide one yet
+		if req.Mode == "" {
+			req.Mode = "LOCAL_SCANNER"
+		}
 
-		// 👉 FIXED: Now correctly passing BOTH WorkspaceID and Target
-		go discoveryAgent.ExtractLeads(req.WorkspaceID, req.Target)
+		fmt.Printf("\n⚡ [API] Directive Received for Workspace [%s]: '%s' via %s. Rerouting...\n", req.WorkspaceID, req.Target, req.Mode)
+
+		// 👉 Send the request securely to the multi-vector Discovery Engine
+		go discoveryAgent.ExtractLeads(req.WorkspaceID, req.Target, req.Mode)
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "Directive Engaged", "workspace_id": req.WorkspaceID})
+		json.NewEncoder(w).Encode(map[string]string{"status": "Directive Engaged", "workspace_id": req.WorkspaceID, "mode": req.Mode})
 	})
 
 	// 👉 Back-Office Ingestion Webhook (The Invisible COO's Ear)
