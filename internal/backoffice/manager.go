@@ -104,6 +104,20 @@ func (m *Manager) RegisterPipeline(workspaceID string, target string) {
 		workspaceID, target, state.ActivePipelines, state.MaxCapacity)
 }
 
+// 👉 NEW: ReleasePipeline safely frees up the capacity slot when a workflow completes or crashes
+func (m *Manager) ReleasePipeline(workspaceID string, targetID string) {
+	state := m.getOrCreateState(workspaceID)
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+
+	if state.ActivePipelines > 0 {
+		state.ActivePipelines--
+		fmt.Printf("♻️ [BACK-OFFICE] Pipeline slot released for Workspace [%s] Target [%s]. Active Load: %d/%d\n", 
+			workspaceID, targetID, state.ActivePipelines, state.MaxCapacity)
+	}
+}
+
 // --- 4. AUTONOMOUS INGESTION & WORKER POOL ---
 
 // StartWorkers listens for incoming internal tickets
@@ -157,11 +171,6 @@ func (m *Manager) processTicket(workerID int, ticket InternalTicket) {
 	log.Printf("[COO-Worker-%d] Task %s autonomously routed and archived for Workspace [%s].", 
 		workerID, ticket.ID, ticket.WorkspaceID)
 
-	// Free up the workspace system capacity once the task is complete
-	state := m.getOrCreateState(ticket.WorkspaceID)
-	state.mu.Lock()
-	if state.ActivePipelines > 0 {
-		state.ActivePipelines--
-	}
-	state.mu.Unlock()
+	// 👉 UPDATED: Use the new ReleasePipeline function to clean up
+	m.ReleasePipeline(ticket.WorkspaceID, ticket.ID)
 }

@@ -55,7 +55,7 @@ type GeminiGenerateResponse struct {
 }
 
 type GeminiEmbeddingRequest struct {
-	Content                GeminiContent `json:"content"`
+	Content              GeminiContent `json:"content"`
 	OutputDimensionality int           `json:"outputDimensionality"`
 }
 
@@ -81,6 +81,8 @@ func (s *Sentinel) React(e protocol.Event) {
 
 		// 3. Reserve pipeline slot
 		s.backOffice.RegisterPipeline(e.WorkspaceID, e.ID)
+
+		defer s.backOffice.ReleasePipeline(e.WorkspaceID, e.ID)
 
 		fmt.Printf("\n⚙️ [SENTINEL] Processing New Context! Workspace: [%s] Target ID: %s\n", e.WorkspaceID, e.ID)
 
@@ -110,7 +112,7 @@ func (s *Sentinel) React(e protocol.Event) {
 
 		// 6. Strategic reasoning loop
 		fmt.Println("⚙️ [SENTINEL] Engaging Cloud Neural Core for strategic writing...")
-		
+
 		safePayload := fmt.Sprintf("%v", e.Payload)
 		if len(safePayload) > 6000 {
 			safePayload = safePayload[:6000]
@@ -132,7 +134,7 @@ func (s *Sentinel) React(e protocol.Event) {
 			},
 		})
 
-		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s", s.apiKey)
+		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=%s", s.apiKey)
 		resp, err := http.Post(url, "application/json", bytes.NewBuffer(reqBody))
 		if err != nil {
 			fmt.Printf("❌ [SENTINEL] Neural Core connection error: %v\n", err)
@@ -171,7 +173,7 @@ func (s *Sentinel) React(e protocol.Event) {
 		s.router.Publish(protocol.Event{
 			WorkspaceID: e.WorkspaceID,
 			ID:          e.ID, // The email recipient
-			Source:      "SENTINEL_TEXT_OUTPUT", 
+			Source:      "SENTINEL_TEXT_OUTPUT",
 			Payload:     responseText,
 			Timestamp:   time.Now().Unix(),
 		})
@@ -186,7 +188,7 @@ func (s *Sentinel) getEmbedding(text string) ([]float32, error) {
 		OutputDimensionality: 768,
 	})
 
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=%s", s.apiKey)
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=%s", s.apiKey)
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(embReq))
 	if err != nil {
 		return nil, err
