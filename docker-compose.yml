@@ -32,7 +32,17 @@ services:
     volumes:
       - ollama_data:/root/.ollama
 
+  # 4. Distributed Message Broker (Enterprise Queueing)
+  redis:
+    image: redis:7-alpine
+    container_name: zeno_message_broker
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
 volumes:
   neo4j_data:
   qdrant_data:
   ollama_data:
+  redis_data:

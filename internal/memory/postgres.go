@@ -22,6 +22,12 @@ func NewRelationalStore(connectionString string) (*RelationalStore, error) {
 		return nil, fmt.Errorf("failed to open Postgres database: %v", err)
 	}
 
+	// 👉 ENTERPRISE UPGRADE: Connection Pool Limits
+	// This prevents 100 concurrent users from exhausting the Supabase connection limits
+	db.SetMaxOpenConns(25)                 // Max simultaneous connections
+	db.SetMaxIdleConns(25)                 // Keep connections warm in memory
+	db.SetConnMaxLifetime(5 * time.Minute) // Safely recycle stale connections
+
 	// Verify the connection is actually alive
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("failed to ping Postgres database: %v", err)
@@ -44,7 +50,7 @@ func NewRelationalStore(connectionString string) (*RelationalStore, error) {
 		return nil, fmt.Errorf("failed to initialize Postgres schema: %v", err)
 	}
 
-	fmt.Println("🗄️ [Supabase] Relational state ledger connected and verified.")
+	fmt.Println("🗄️ [Supabase] Relational state ledger connected and verified (Pooled).")
 	return &RelationalStore{DB: db}, nil
 }
 
