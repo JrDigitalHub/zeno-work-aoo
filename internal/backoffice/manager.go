@@ -253,3 +253,27 @@ func (m *PipelineManager) Ingest(workspaceID, source, payload string) {
 		log.Printf("⚠️ [COO] Failed to route external ingestion to task list: %v", err)
 	}
 }
+func (m *PipelineManager) CheckCapacity(workspaceID string) bool {
+    var count int
+    err := m.DB.QueryRow("SELECT COUNT(*) FROM tasks WHERE workspace_id = $1 AND status = 'PENDING'", workspaceID).Scan(&count)
+    if err != nil {
+        return false
+    }
+    return count < 50
+}
+
+func (m *PipelineManager) RegisterPipeline(workspaceID, targetID string) {
+    _, err := m.DB.Exec("INSERT INTO tasks (workspace_id, task_type, status, context) VALUES ($1, $2, $3, $4)", 
+        workspaceID, "SENTINEL_PROCESS", "PROCESSING", targetID)
+    if err != nil {
+        log.Printf("⚠️ [COO] Failed to register pipeline: %v", err)
+    }
+}
+
+func (m *PipelineManager) ReleasePipeline(workspaceID, targetID string) {
+    _, err := m.DB.Exec("UPDATE tasks SET status = $1 WHERE workspace_id = $2 AND context = $3", 
+        "COMPLETED", workspaceID, targetID)
+    if err != nil {
+        log.Printf("⚠️ [COO] Failed to release pipeline: %v", err)
+    }
+} 
