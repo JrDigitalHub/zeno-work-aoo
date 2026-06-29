@@ -66,12 +66,21 @@ func (m *PipelineManager) ReservePipeline(workspaceID, targetID string) {
 
 // ReleasePipeline decrements the active job count and frees the slot
 func (m *PipelineManager) ReleasePipeline(workspaceID, targetID string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.activePipelines[workspaceID] > 0 {
-		m.activePipelines[workspaceID]--
-	}
-	fmt.Printf("♻️ [BACK-OFFICE] Pipeline slot released for Workspace [%s] Target [%s]. Active Load: %d/10\n", workspaceID, targetID, m.activePipelines[workspaceID])
+    // 1. Update the persistent Task database (The Dashboard State)
+    _, err := m.DB.Exec("UPDATE tasks SET status = $1 WHERE workspace_id = $2 AND context = $3", 
+        "COMPLETED", workspaceID, targetID)
+    if err != nil {
+        log.Printf("⚠️ [COO] Failed to release pipeline: %v", err)
+    }
+
+    // 2. Update the in-memory load balancer (The Concurrency Manager)
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    if m.activePipelines[workspaceID] > 0 {
+        m.activePipelines[workspaceID]--
+    }
+    
+    fmt.Printf("♻️ [BACK-OFFICE] Pipeline slot released for Workspace [%s] Target [%s]. Active Load: %d/10\n", workspaceID, targetID, m.activePipelines[workspaceID])
 }
 
 // =====================================================================
@@ -270,10 +279,3 @@ func (m *PipelineManager) RegisterPipeline(workspaceID, targetID string) {
     }
 }
 
-func (m *PipelineManager) ReleasePipeline(workspaceID, targetID string) {
-    _, err := m.DB.Exec("UPDATE tasks SET status = $1 WHERE workspace_id = $2 AND context = $3", 
-        "COMPLETED", workspaceID, targetID)
-    if err != nil {
-        log.Printf("⚠️ [COO] Failed to release pipeline: %v", err)
-    }
-} 
