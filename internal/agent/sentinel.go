@@ -18,12 +18,12 @@ import (
 type Sentinel struct {
 	graphStore  *memory.SovereignStore
 	vectorStore *memory.VectorStore
-	backOffice  *backoffice.Manager
+	backOffice  *backoffice.PipelineManager
 	router      *orchestrator.EventRouter
 	apiKey      string
 }
 
-func NewSentinel(gs *memory.SovereignStore, vs *memory.VectorStore, bo *backoffice.Manager, r *orchestrator.EventRouter) *Sentinel {
+func NewSentinel(gs *memory.SovereignStore, vs *memory.VectorStore, bo *backoffice.PipelineManager, r *orchestrator.EventRouter) *Sentinel {
 	return &Sentinel{
 		graphStore:  gs,
 		vectorStore: vs,

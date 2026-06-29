@@ -1,11 +1,17 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"sync"
+	"context"
+	"syscall"
+	"time"
+	"os/signal"
+	"log/slog"
 
 	"github.com/joho/godotenv" // Securely load your secrets
 
@@ -13,6 +19,7 @@ import (
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/backoffice"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/comms"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/memory"
+	"github.com/JrDigitalHub/zeno-work-aoo/internal/middleware"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/orchestrator"
 	"github.com/JrDigitalHub/zeno-work-aoo/pkg/protocol"
 )
@@ -30,6 +37,18 @@ func main() {
 	if err := godotenv.Load(); err != nil {
 		fmt.Println("⚠️  No .env file found, relying on system environment variables.")
 	}
+
+	
+	// Configure global JSON logger for production readability
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
+	slog.Info("ZENO OS Boot Sequence Initiated", 
+		slog.String("module", "core_system"),
+		slog.String("status", "booting"),
+	)
 
 	// 1. Ignite Neo4j (NOW CLOUD READY)
 	neo4jURI := os.Getenv("NEO4J_URI")
@@ -67,6 +86,7 @@ func main() {
 
 	// 2.5 Ignite Relational Brain (Supabase / Postgres)
 	var relationalBrain *memory.RelationalStore
+	var dbConn *sql.DB // Safely extract the *sql.DB for the COO service
 
 	supabaseURL := os.Getenv("SUPABASE_URL")
 	if supabaseURL == "" {
@@ -77,11 +97,13 @@ func main() {
 			panic(fmt.Sprintf("❌ CRITICAL: Failed to boot Relational Memory: %v", err))
 		}
 		relationalBrain = store
+		dbConn = store.DB
 		defer relationalBrain.Close()
 	}
 
 	// 3. Initialize Back-Office (Enterprise Multi-Tenant Mode)
-	opsManager := backoffice.NewManager(10, 3)
+	// Properly pass the dbConn so the COO can manage the tasks table
+	opsManager := backoffice.NewPipelineManager(dbConn)
 
 	// 4. Ignite Router
 	router := orchestrator.NewEventRouter()
@@ -131,6 +153,90 @@ func main() {
 
 	// 👉 Expose the WebSocket channel safely for Render
 	http.Handle("/ws", wsEngine)
+
+	// =========================================================================
+	// 🛡️ NEW ENTERPRISE COO API ROUTES (PROTECTED BY AUTHENTICATION MIDDLEWARE)
+	// =========================================================================
+
+	// GET /api/v1/coo/tasks - Returns active kanban tasks to the UI
+	http.HandleFunc("/api/v1/coo/tasks", middleware.EngineSecurityGuard(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method == http.MethodGet {
+			opsManager.HandleGetTasks(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+
+	// PATCH /api/v1/coo/tasks/{id} - Allows the CEO to approve/reject tasks
+	http.HandleFunc("/api/v1/coo/tasks/", middleware.EngineSecurityGuard(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "PATCH, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method == http.MethodPatch {
+			opsManager.HandleUpdateTask(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+
+	// =========================================================================
+	// 🛡️ NEW ENTERPRISE CFO API ROUTES (FINANCE & LEDGER)
+	// =========================================================================
+
+	// GET /api/v1/cfo/ledger - Returns the immutable double-entry history
+	http.HandleFunc("/api/v1/cfo/ledger", middleware.EngineSecurityGuard(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method == http.MethodGet {
+			modelerAgent.HandleGetLedger(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+
+	// POST /api/v1/cfo/invoices - Accepts documents for AI OCR categorization
+	http.HandleFunc("/api/v1/cfo/invoices", middleware.EngineSecurityGuard(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method == http.MethodPost {
+			modelerAgent.HandleIngestInvoice(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+
+	// =========================================================================
+	// LEGACY ROUTES
+	// =========================================================================
 
 	// 👉 API Master Kill Switch (Protects API Credits Globally)
 	http.HandleFunc("/api/v1/system/toggle", func(w http.ResponseWriter, r *http.Request) {
@@ -280,21 +386,55 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ZENO_ACKNOWLEDGED", "workspace_id": req.WorkspaceID})
 	})
 
-	// Boot the HTTP/Websocket Server
-	go func() {
-		port := os.Getenv("PORT")
-		if port == "" {
-			port = "8080"
-		}
-		fmt.Printf("🌐 [HTTP] Streaming state socket & API listening on port: %s\n", port)
+	// =========================================================================
+	// 🛡️ THE PRODUCTION SERVER ENGINE & GRACEFUL SHUTDOWN
+	// =========================================================================
 
-		if err := http.ListenAndServe("0.0.0.0:"+port, nil); err != nil {
-			fmt.Printf("❌ CRITICAL: Server tracking socket runtime crash: %v\n", err)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	// 1. Wrap the entire default router in the CORS middleware
+	corsProtectedRouter := middleware.CorsGuard(http.DefaultServeMux)
+
+	// 2. Instantiate the HTTP Server object properly for production
+	srv := &http.Server{
+		Addr:    "0.0.0.0:" + port,
+		Handler: corsProtectedRouter,
+	}
+
+	// 3. Boot the server in a separate goroutine
+	go func() {
+		slog.Info("🌐 [HTTP] Streaming state socket & API listening", slog.String("port", port))
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("CRITICAL: Server runtime crash", slog.Any("error", err))
 		}
 	}()
 
-	fmt.Println("\n🛡️  [SYSTEM] ZENO Backend Online. Waiting for client directives...")
+	slog.Info("🛡️  [SYSTEM] ZENO Backend Online. Waiting for client directives...")
 
-	// Server runs 24/7 now.
-	select {}
+	// 4. Set up the Render/Fly.io Kill Signal Catcher
+	quit := make(chan os.Signal, 1)
+	// We also need to make sure we import "os/signal" and "syscall" at the top of main.go for this to work
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+
+	// 5. Block the main thread here until a shutdown signal is received
+	<-quit
+	slog.Info("🛑 [SYSTEM] SIGTERM received. Initiating graceful shutdown sequence...")
+
+	// 6. Give the CFO and database 10 seconds to finish writing transactions
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		slog.Error("Server forced to shutdown", slog.Any("error", err))
+	}
+
+	// 7. Safely close the database connection pool
+	if relationalBrain != nil {
+		relationalBrain.Close()
+	}
+
+	slog.Info("💤 [SYSTEM] Zeno OS offline. Safe to restart.")
 }

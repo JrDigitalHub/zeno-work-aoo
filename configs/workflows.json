@@ -1,0 +1,9 @@
+{
+  "coo_agent_rules": {
+    "auto_approve_threshold_score": 85,
+    "require_human_audit_on_fail": true,
+    "unreachable_url_fallback": "TRIGGER_MANUAL_RESEARCH",
+    "supported_currencies": ["USD", "EUR", "NGN"],
+    "max_compute_cost_per_session_usd": 2.50
+  }
+}

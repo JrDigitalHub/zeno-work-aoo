@@ -1,176 +1,255 @@
 package backoffice
 
 import (
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
+	"os"
 )
 
-// --- 1. SYSTEM STATE & STRUCTS ---
-
-// SystemState holds the real-time operational capacity of a specific business workspace
-type SystemState struct {
-	ActivePipelines int
-	MaxCapacity     int
-	mu              sync.Mutex // Mutex ensures accurate counting during highly concurrent crawls per client
-}
-
-// InternalTicket represents an ingested operational task bound to a specific workspace
-type InternalTicket struct {
-	WorkspaceID string    `json:"workspace_id"` // Enterprise isolation key
-	ID          string    `json:"id"`
-	Source      string    `json:"source"` // e.g., "SLACK", "EMAIL"
-	Payload     string    `json:"payload"`
-	Category    string    `json:"category"`
-	Urgency     string    `json:"urgency"`
+// Task represents a business operation waiting for COO/Human approval.
+// This directly maps to the Next.js frontend schema.
+type Task struct {
+	TaskID      string    `json:"task_id"`
+	WorkspaceID string    `json:"workspace_id"`
+	OwnerRole   string    `json:"owner_role"`
+	Priority    string    `json:"priority"`
 	Status      string    `json:"status"`
-	Timestamp   time.Time `json:"timestamp"`
+	Context     string    `json:"context"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
-type Manager struct {
-	DefaultMaxCapacity int                     // Fallback max capacity for newly registered workspaces
-	ClientStates       map[string]*SystemState // Isolated map holding states per workspace
-	stateMu            sync.RWMutex            // RWMutex guards the map during high-concurrency multi-client lookups
-	WorkerCount        int                     // Number of concurrent back-office workers
-	TaskQueue          chan InternalTicket     // Channel for incoming operational tasks
+// PipelineManager acts as the Chief Operating Officer (COO).
+// It manages real-time pipeline capacity AND asynchronous operational tasks.
+type PipelineManager struct {
+	activePipelines map[string]int
+	mu              sync.Mutex
+	DB              *sql.DB // The Postgres connection for the State Machine
 }
 
-// --- 2. INITIALIZATION ---
+// NewPipelineManager initializes the COO service
+func NewPipelineManager(db *sql.DB) *PipelineManager {
+	fmt.Println("🏢 [COO-SERVICE] Initializing Operational Workflow Manager & REST API...")
+	return &PipelineManager{
+		activePipelines: make(map[string]int),
+		DB:              db,
+	}
+}
 
-// NewManager initializes the internal resource tracker and the autonomous worker pool with multi-tenant maps
-func NewManager(defaultMaxCapacity int, workerCount int) *Manager {
-	fmt.Println("🏢 [BACK-OFF-MULTITENANT] Initializing Operational Workflow Manager for Production...")
-	m := &Manager{
-		DefaultMaxCapacity: defaultMaxCapacity,
-		ClientStates:       make(map[string]*SystemState),
-		WorkerCount:        workerCount,
-		TaskQueue:          make(chan InternalTicket, 100),
+// =====================================================================
+// 1. LEGACY PIPELINE CAPACITY TRACKING (Keeps Sentinel & Predator safe)
+// =====================================================================
+
+// ProvisionWorkspace sets up the initial load capacity for a tenant
+func (m *PipelineManager) ProvisionWorkspace(workspaceID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.activePipelines[workspaceID]; !exists {
+		m.activePipelines[workspaceID] = 0
+		log.Printf("🏢 [BACK-OFFICE] Provisioned isolated operational pipeline state for Workspace [%s]\n", workspaceID)
+	}
+}
+
+// ReservePipeline increments the active job count for a tenant
+func (m *PipelineManager) ReservePipeline(workspaceID, targetID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.activePipelines[workspaceID]++
+	fmt.Printf("🏢 [BACK-OFFICE] Pipeline capacity reserved for Workspace [%s] Target [%s]. Active Load: %d/10\n", workspaceID, targetID, m.activePipelines[workspaceID])
+}
+
+// ReleasePipeline decrements the active job count and frees the slot
+func (m *PipelineManager) ReleasePipeline(workspaceID, targetID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.activePipelines[workspaceID] > 0 {
+		m.activePipelines[workspaceID]--
+	}
+	fmt.Printf("♻️ [BACK-OFFICE] Pipeline slot released for Workspace [%s] Target [%s]. Active Load: %d/10\n", workspaceID, targetID, m.activePipelines[workspaceID])
+}
+
+// =====================================================================
+// 2. ENTERPRISE COO STATE MACHINE (API-First Task Management)
+// =====================================================================
+
+// CreateTask safely inserts a new operational requirement into the Postgres ledger
+// This is called internally by your Go agents when a human needs to review something.
+func (m *PipelineManager) CreateTask(workspaceID, priority, context string) error {
+	if m.DB == nil {
+		return fmt.Errorf("database connection is not initialized in COO service")
 	}
 
-	// Start the autonomous worker pool
-	m.StartWorkers()
-
-	return m
-}
-
-// getOrCreateState retrieves or provisions a specific operational state for a workspace safely
-func (m *Manager) getOrCreateState(workspaceID string) *SystemState {
-	m.stateMu.RLock()
-	state, exists := m.ClientStates[workspaceID]
-	m.stateMu.RUnlock()
-
-	if exists {
-		return state
+	query := `
+		INSERT INTO tasks (workspace_id, owner_role, priority, status, context, created_at, updated_at)
+		VALUES ($1, 'COO', $2, 'PENDING', $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+	`
+	_, err := m.DB.Exec(query, workspaceID, priority, context)
+	if err != nil {
+		return fmt.Errorf("failed to create COO task: %v", err)
 	}
-
-	// Double-checked locking pattern for safe lazy initialization
-	m.stateMu.Lock()
-	state, exists = m.ClientStates[workspaceID]
-	if !exists {
-		state = &SystemState{
-			ActivePipelines: 0,
-			MaxCapacity:     m.DefaultMaxCapacity,
-		}
-		m.ClientStates[workspaceID] = state
-		log.Printf("🏢 [BACK-OFFICE] Provisioned isolated operational pipeline state for Workspace [%s]", workspaceID)
-	}
-	m.stateMu.Unlock()
-
-	return state
-}
-
-// --- 3. CORE CAPACITY LOGIC (ENTERPRISE ISOLATED) ---
-
-// CheckCapacity evaluates if a specific business workspace can handle a new lead or internal task
-func (m *Manager) CheckCapacity(workspaceID string) bool {
-	state := m.getOrCreateState(workspaceID)
-
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	return state.ActivePipelines < state.MaxCapacity
-}
-
-// RegisterPipeline locks in the resource once a lead or task is processed for a specific workspace
-func (m *Manager) RegisterPipeline(workspaceID string, target string) {
-	state := m.getOrCreateState(workspaceID)
-
-	state.mu.Lock()
-	defer state.mu.Unlock()
 	
-	state.ActivePipelines++
-	fmt.Printf("🏢 [BACK-OFFICE] Pipeline capacity reserved for Workspace [%s] Target [%s]. Active Load: %d/%d\n", 
-		workspaceID, target, state.ActivePipelines, state.MaxCapacity)
+	log.Printf("📋 [COO] New %s priority task created for Workspace [%s]: %s", priority, workspaceID, context)
+	return nil
 }
 
-// 👉 NEW: ReleasePipeline safely frees up the capacity slot when a workflow completes or crashes
-func (m *Manager) ReleasePipeline(workspaceID string, targetID string) {
-	state := m.getOrCreateState(workspaceID)
-
-	state.mu.Lock()
-	defer state.mu.Unlock()
-
-	if state.ActivePipelines > 0 {
-		state.ActivePipelines--
-		fmt.Printf("♻️ [BACK-OFFICE] Pipeline slot released for Workspace [%s] Target [%s]. Active Load: %d/%d\n", 
-			workspaceID, targetID, state.ActivePipelines, state.MaxCapacity)
+// HandleGetTasks acts as the REST API endpoint: GET /api/v1/coo/tasks
+// It serves the active Kanban board to your Next.js application.
+func (m *PipelineManager) HandleGetTasks(w http.ResponseWriter, r *http.Request) {
+	// In production, your middleware passes the workspace_id through the request context.
+	// We extract it here to ensure data isolation.
+	ctxWorkspace := r.Context().Value("workspace_id")
+	if ctxWorkspace == nil {
+		http.Error(w, `{"error": "Unauthorized. Missing workspace context."}`, http.StatusUnauthorized)
+		return
 	}
-}
+	workspaceID := fmt.Sprintf("%v", ctxWorkspace)
 
-// --- 4. AUTONOMOUS INGESTION & WORKER POOL ---
+	// Allow filtering by status (e.g., ?status=pending)
+	statusFilter := r.URL.Query().Get("status")
+	
+	var rows *sql.Rows
+	var err error
 
-// StartWorkers listens for incoming internal tickets
-func (m *Manager) StartWorkers() {
-	for i := 0; i < m.WorkerCount; i++ {
-		go func(workerID int) {
-			for ticket := range m.TaskQueue {
-				m.processTicket(workerID, ticket)
-			}
-		}(i)
-	}
-}
-
-// Ingest acts as the triage router for incoming multi-tenant data
-func (m *Manager) Ingest(workspaceID string, source string, rawPayload string) {
-	// Pass the raw text to the Triage Brain (Requires triage.go)
-	matrix := AnalyzePayload(rawPayload)
-
-	ticket := InternalTicket{
-		WorkspaceID: workspaceID,
-		ID:          fmt.Sprintf("ZENO-OP-%d", time.Now().Unix()),
-		Source:      source,
-		Payload:     rawPayload,
-		Category:    matrix.Category,
-		Urgency:     matrix.Urgency,
-		Status:      "OPEN",
-		Timestamp:   time.Now(),
-	}
-
-	log.Printf("🏢 [BACK-OFFICE] Triage Alert for [%s]: %s payload classified as [%s | %s]. Action Required: %s", 
-		workspaceID, source, matrix.Category, matrix.Urgency, matrix.Action)
-		
-	// Check capacity for this specific client workspace before queuing
-	if m.CheckCapacity(workspaceID) {
-		m.RegisterPipeline(workspaceID, ticket.ID)
-		m.TaskQueue <- ticket
+	if statusFilter != "" {
+		query := `SELECT task_id, workspace_id, owner_role, priority, status, context, created_at, updated_at FROM tasks WHERE workspace_id = $1 AND status = $2 ORDER BY created_at DESC`
+		rows, err = m.DB.Query(query, workspaceID, strings.ToUpper(statusFilter))
 	} else {
-		log.Printf("⚠️ [BACK-OFFICE] OVERLOAD for [%s]: Cannot route ticket %s. Max capacity reached.", workspaceID, ticket.ID)
-		// In a production system, you would push this to a Redis dead-letter queue here
+		query := `SELECT task_id, workspace_id, owner_role, priority, status, context, created_at, updated_at FROM tasks WHERE workspace_id = $1 ORDER BY created_at DESC`
+		rows, err = m.DB.Query(query, workspaceID)
 	}
+
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "Database read failed: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var tasks []Task
+	for rows.Next() {
+		var t Task
+		if err := rows.Scan(&t.TaskID, &t.WorkspaceID, &t.OwnerRole, &t.Priority, &t.Status, &t.Context, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			log.Printf("⚠️ [COO] Failed to parse a task row: %v", err)
+			continue
+		}
+		tasks = append(tasks, t)
+	}
+
+	// Ensure we return an empty array [] instead of null if there are no tasks
+	if tasks == nil {
+		tasks = []Task{}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(tasks)
 }
 
-// processTicket executes the required operational workflow and isolates metrics by tenant
-func (m *Manager) processTicket(workerID int, ticket InternalTicket) {
-	log.Printf("[COO-Worker-%d] Executing Task for Workspace [%s]: %s | Priority: %s", 
-		workerID, ticket.WorkspaceID, ticket.ID, ticket.Urgency)
-	
-	time.Sleep(2 * time.Second) // Simulate database write or API execution
-	
-	// TODO: Broadcast ticket creation back to Next.js UI via WebSockets (Ensure client channel filtering)
-	log.Printf("[COO-Worker-%d] Task %s autonomously routed and archived for Workspace [%s].", 
-		workerID, ticket.ID, ticket.WorkspaceID)
+// HandleUpdateTask acts as the REST API endpoint: PATCH /api/v1/coo/tasks/{id}
+// It allows the Next.js frontend to Approve, Reject, or Complete a task.
+func (m *PipelineManager) HandleUpdateTask(w http.ResponseWriter, r *http.Request) {
+	ctxWorkspace := r.Context().Value("workspace_id")
+	if ctxWorkspace == nil {
+		http.Error(w, `{"error": "Unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	workspaceID := fmt.Sprintf("%v", ctxWorkspace)
 
-	// 👉 UPDATED: Use the new ReleasePipeline function to clean up
-	m.ReleasePipeline(ticket.WorkspaceID, ticket.ID)
+	if r.Method != http.MethodPatch {
+		http.Error(w, `{"error": "Method not allowed. Use PATCH."}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract Task ID from the URL path (e.g., /api/v1/coo/tasks/123e4567-e89b-12d3...)
+	parts := strings.Split(r.URL.Path, "/")
+	taskID := parts[len(parts)-1]
+
+	var reqBody struct {
+		Status string `json:"status"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+		http.Error(w, `{"error": "Invalid JSON payload"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Validate the status strictly against our allowed enum values
+	newStatus := strings.ToUpper(reqBody.Status)
+	validStatuses := map[string]bool{"PENDING": true, "IN_REVIEW": true, "APPROVED": true, "REJECTED": true, "COMPLETED": true}
+	if !validStatuses[newStatus] {
+		http.Error(w, `{"error": "Invalid status value"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Update the database securely
+	query := `
+		UPDATE tasks 
+		SET status = $1, updated_at = CURRENT_TIMESTAMP 
+		WHERE task_id = $2 AND workspace_id = $3
+	`
+	res, err := m.DB.Exec(query, newStatus, taskID, workspaceID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "Database update failed: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		http.Error(w, `{"error": "Task not found or unauthorized"}`, http.StatusNotFound)
+		return
+	}
+
+	log.Printf("✅ [COO] Task [%s] updated to [%s] by Executive Command", taskID, newStatus)
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"success": true, "message": "Task state updated successfully"}`))
+}
+// WorkflowConfig represents the dynamic rules for the COO
+type WorkflowConfig struct {
+	AutoApproveScore int      `json:"auto_approve_threshold_score"`
+	RequireHuman     bool     `json:"require_human_audit_on_fail"`
+	Currencies       []string `json:"supported_currencies"`
+	MaxComputeCost   float64  `json:"max_compute_cost_per_session_usd"`
+}
+
+// LoadWorkflowRules reads the JSON config into memory
+func (m *PipelineManager) LoadWorkflowRules() (*WorkflowConfig, error) {
+	file, err := os.ReadFile("configs/workflows.json")
+	if err != nil {
+		return nil, fmt.Errorf("could not load workflow rules: %v", err)
+	}
+
+	var wrapper struct {
+		Rules WorkflowConfig `json:"coo_agent_rules"`
+	}
+	
+	if err := json.Unmarshal(file, &wrapper); err != nil {
+		return nil, fmt.Errorf("failed to parse workflow JSON: %v", err)
+	}
+	
+	log.Printf("🏢 [COO] Workflow rules loaded. Auto-Approve Threshold: %d", wrapper.Rules.AutoApproveScore)
+	return &wrapper.Rules, nil
+}
+// =====================================================================
+// 3. EXTERNAL WEBHOOK INGESTION (The COO's Ear)
+// =====================================================================
+
+// Ingest receives raw data payloads from external sources (webhooks, Shopline, etc.)
+// and automatically routes them into actionable COO tasks on the Kanban board.
+func (m *PipelineManager) Ingest(workspaceID, source, payload string) {
+	log.Printf("📥 [COO] Raw data ingested for Workspace [%s] from Source [%s]", workspaceID, source)
+
+	// Convert this ingestion into an actionable task for the dashboard
+	contextMsg := fmt.Sprintf("Review inbound data from %s. Payload summary: %s", source, payload)
+
+	// Route it to the database as a MEDIUM priority task
+	err := m.CreateTask(workspaceID, "MEDIUM", contextMsg)
+	if err != nil {
+		log.Printf("⚠️ [COO] Failed to route external ingestion to task list: %v", err)
+	}
 }
