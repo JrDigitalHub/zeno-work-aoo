@@ -1,17 +1,19 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
+	"strings"
 	"sync"
-	"context"
 	"syscall"
 	"time"
-	"os/signal"
-	"log/slog"
 
 	"github.com/joho/godotenv" // Securely load your secrets
 
@@ -232,6 +234,224 @@ func main() {
 		} else {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
+	}))
+
+	// =========================================================================
+	// 🛡️ NEW TOKEN WALLET & CHAT ROUTER ROUTES
+	// =========================================================================
+
+	// GET /api/v1/wallet - Returns current token balance and subscription tier
+	http.HandleFunc("/api/v1/wallet", middleware.EngineSecurityGuard(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctxWorkspace := r.Context().Value(middleware.WorkspaceContextKey)
+		if ctxWorkspace == nil {
+			ctxWorkspace = r.Context().Value("workspace_id")
+		}
+		if ctxWorkspace == nil {
+			http.Error(w, `{"error": "Unauthorized. Missing workspace context."}`, http.StatusUnauthorized)
+			return
+		}
+		workspaceID := fmt.Sprintf("%v", ctxWorkspace)
+
+		var balance int
+		var tier string
+		var err error
+
+		if relationalBrain != nil {
+			balance, tier, err = relationalBrain.GetTokenWallet(workspaceID)
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"error": "Failed to fetch wallet: %v"}`, err), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			// Mock default values if DB is offline
+			balance = 50000
+			tier = "Trial"
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"token_balance":     balance,
+			"subscription_tier": tier,
+		})
+	}))
+
+	// POST /api/v1/chat - Routes agent prompt directly to Gemini, deducting tokens
+	http.HandleFunc("/api/v1/chat", middleware.EngineSecurityGuard(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse request payload
+		var req struct {
+			WorkspaceID string `json:"workspace_id"`
+			AgentType   string `json:"agent_type"`
+			Message     string `json:"message"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error": "Invalid request payload"}`, http.StatusBadRequest)
+			return
+		}
+
+		ctxWorkspace := r.Context().Value(middleware.WorkspaceContextKey)
+		if ctxWorkspace == nil {
+			ctxWorkspace = r.Context().Value("workspace_id")
+		}
+		workspaceID := ""
+		if ctxWorkspace != nil {
+			workspaceID = fmt.Sprintf("%v", ctxWorkspace)
+		}
+		if workspaceID == "" {
+			workspaceID = req.WorkspaceID
+		}
+		if workspaceID == "" {
+			http.Error(w, `{"error": "Workspace ID is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		// 1. Deduct tokens (150 tokens)
+		var newBalance int
+		if relationalBrain != nil {
+			var err error
+			newBalance, err = relationalBrain.DeductTokens(workspaceID, 150)
+			if err != nil {
+				if strings.Contains(err.Error(), "insufficient tokens") {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusTooManyRequests) // 429
+					json.NewEncoder(w).Encode(map[string]string{"error": "Token limit reached"})
+					return
+				}
+				http.Error(w, fmt.Sprintf(`{"error": "Database error: %v"}`, err), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			// Mock default deduction if DB is offline
+			newBalance = 49850
+			slog.Info("DB offline, mock token deduction successful", slog.String("workspace_id", workspaceID))
+		}
+
+		// 2. Call Gemini API
+		apiKey := os.Getenv("GEMINI_API_KEY")
+		if apiKey == "" {
+			http.Error(w, `{"error": "Gemini API key is not configured"}`, http.StatusInternalServerError)
+			return
+		}
+
+		geminiURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s", apiKey)
+
+		// Set system instruction prompt based on agent type
+		systemPrompt := "You are the Zeno OS Autonomous Operations Officer. Help the user."
+		switch strings.ToUpper(req.AgentType) {
+		case "COO":
+			systemPrompt = "You are the Zeno OS Autonomous Operations Officer (COO). You handle operational tasks, kanban boards, process automation, and workflow orchestration. Keep responses professional, clear, and action-oriented."
+		case "CFO":
+			systemPrompt = "You are the Zeno OS Chief Financial Officer (CFO). You manage double-entry bookkeeping, cash flow projections, invoice audits, and unit economics. Keep responses precise, analytical, and structured."
+		case "ORACLE":
+			systemPrompt = "You are the Zeno OS Oracle. You analyze the Neo4j Knowledge Graph, evaluate strategic business opportunities, identify bottlenecks, and advise on market growth. Keep responses insightful, visionary, and qualitative."
+		}
+
+		type GeminiPart struct {
+			Text string `json:"text"`
+		}
+		type GeminiContent struct {
+			Parts []GeminiPart `json:"parts"`
+		}
+		type GeminiSystemInstr struct {
+			Parts []GeminiPart `json:"parts"`
+		}
+		type GeminiRequest struct {
+			Contents          []GeminiContent    `json:"contents"`
+			SystemInstruction *GeminiSystemInstr `json:"systemInstruction,omitempty"`
+		}
+
+		geminiReq := GeminiRequest{
+			Contents: []GeminiContent{
+				{
+					Parts: []GeminiPart{
+						{Text: req.Message},
+					},
+				},
+			},
+			SystemInstruction: &GeminiSystemInstr{
+				Parts: []GeminiPart{
+					{Text: systemPrompt},
+				},
+			},
+		}
+
+		reqBytes, err := json.Marshal(geminiReq)
+		if err != nil {
+			http.Error(w, `{"error": "Failed to build Gemini request"}`, http.StatusInternalServerError)
+			return
+		}
+
+		resp, err := http.Post(geminiURL, "application/json", bytes.NewBuffer(reqBytes))
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error": "Gemini API call failed: %v"}`, err), http.StatusInternalServerError)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			var errResp map[string]interface{}
+			json.NewDecoder(resp.Body).Decode(&errResp)
+			slog.Error("Gemini API returned error", slog.Any("details", errResp))
+			http.Error(w, fmt.Sprintf(`{"error": "Gemini API returned status %d"}`, resp.StatusCode), http.StatusInternalServerError)
+			return
+		}
+
+		type GeminiResponse struct {
+			Candidates []struct {
+				Content struct {
+					Parts []struct {
+						Text string `json:"text"`
+					} `json:"parts"`
+				} `json:"content"`
+			} `json:"candidates"`
+		}
+
+		var geminiResp GeminiResponse
+		if err := json.NewDecoder(resp.Body).Decode(&geminiResp); err != nil {
+			http.Error(w, `{"error": "Failed to decode Gemini response"}`, http.StatusInternalServerError)
+			return
+		}
+
+		outputText := ""
+		if len(geminiResp.Candidates) > 0 && len(geminiResp.Candidates[0].Content.Parts) > 0 {
+			outputText = geminiResp.Candidates[0].Content.Parts[0].Text
+		}
+
+		// Return response
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"response":      outputText,
+			"workspace_id":  workspaceID,
+			"agent_type":    req.AgentType,
+			"token_balance": newBalance,
+		})
 	}))
 
 	// =========================================================================

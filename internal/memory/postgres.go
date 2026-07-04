@@ -49,6 +49,24 @@ func NewRelationalStore(connectionString string) (*RelationalStore, error) {
 		return nil, fmt.Errorf("failed to initialize Postgres schema: %v", err)
 	}
 
+	// Initialize workspaces table and add columns if they are missing
+	workspacesSchema := `
+	CREATE TABLE IF NOT EXISTS workspaces (
+		id VARCHAR(255) PRIMARY KEY,
+		name VARCHAR(255) NOT NULL,
+		is_paused BOOLEAN DEFAULT FALSE,
+		token_balance INT DEFAULT 50000,
+		subscription_tier VARCHAR(50) DEFAULT 'Trial'
+	);
+	ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS token_balance INT DEFAULT 50000;
+	ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS subscription_tier VARCHAR(50) DEFAULT 'Trial';
+	ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS is_paused BOOLEAN DEFAULT FALSE;
+	`
+	_, err = db.Exec(workspacesSchema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize workspaces schema: %v", err)
+	}
+
 	fmt.Println("🗄️ [Supabase] Relational state ledger connected and verified (Pooled).")
 	return &RelationalStore{DB: db}, nil
 }
