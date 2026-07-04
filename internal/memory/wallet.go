@@ -79,3 +79,34 @@ func (r *RelationalStore) DeductTokens(workspaceID string, amount int) (int, err
 	}
 	return newBalance, nil
 }
+
+// ProvisionNewWorkspace checks if a workspace exists in the workspaces table.
+// If it does not exist, it inserts a clean production-grade row initialized with exactly 50000 tokens,
+// the "Trial" subscription_tier, and stores the user's email safely.
+func (r *RelationalStore) ProvisionNewWorkspace(workspaceID string, email string) error {
+	var exists bool
+	query := `SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)`
+	err := r.DB.QueryRow(query, workspaceID).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("failed to check workspace existence: %v", err)
+	}
+
+	if exists {
+		return nil
+	}
+
+	// Insert clean production-grade row initialized with exactly 50000 tokens, "Trial" tier, and email.
+	insertQuery := `
+		INSERT INTO workspaces (id, name, is_paused, token_balance, subscription_tier, email)
+		VALUES ($1, $2, FALSE, $3, $4, $5)
+		ON CONFLICT (id) DO NOTHING
+	`
+	name := "Workspace " + workspaceID
+	_, err = r.DB.Exec(insertQuery, workspaceID, name, 50000, "Trial", email)
+	if err != nil {
+		return fmt.Errorf("failed to provision workspace: %v", err)
+	}
+
+	return nil
+}
+

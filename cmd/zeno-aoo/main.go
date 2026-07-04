@@ -607,6 +607,106 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ZENO_ACKNOWLEDGED", "workspace_id": req.WorkspaceID})
 	})
 
+	// 👉 Supabase Auth Webhook (Unauthenticated, protected by X-Webhook-Secret)
+	http.HandleFunc("/api/v1/webhooks/supabase-auth", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Webhook-Secret")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+			return
+		}
+
+		// Security Check
+		secret := os.Getenv("SUPABASE_WEBHOOK_SECRET")
+		receivedHeader := r.Header.Get("X-Webhook-Secret")
+		if secret == "" || receivedHeader != secret {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized. Missing or invalid secret."})
+			return
+		}
+
+		// Struct to decode the incoming payload dynamically
+		type SupabaseAuthRecord struct {
+			ID    string `json:"id"`
+			Email string `json:"email"`
+		}
+
+		type SupabaseAuthWebhookPayload struct {
+			Type   string              `json:"type"`
+			Table  string              `json:"table"`
+			Schema string              `json:"schema"`
+			Record *SupabaseAuthRecord `json:"record"`
+			User   *SupabaseAuthRecord `json:"user"`
+			ID     string              `json:"id"`
+			Email  string              `json:"email"`
+		}
+
+		var payload SupabaseAuthWebhookPayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request payload"})
+			return
+		}
+
+		var workspaceID string
+		var email string
+
+		if payload.Record != nil {
+			workspaceID = payload.Record.ID
+			email = payload.Record.Email
+		} else if payload.User != nil {
+			workspaceID = payload.User.ID
+			email = payload.User.Email
+		} else {
+			workspaceID = payload.ID
+			email = payload.Email
+		}
+
+		workspaceID = strings.TrimSpace(workspaceID)
+		email = strings.TrimSpace(email)
+
+		if workspaceID == "" || email == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid payload: missing id or email"})
+			return
+		}
+
+		if relationalBrain != nil {
+			if err := relationalBrain.ProvisionNewWorkspace(workspaceID, email); err != nil {
+				slog.Error("Failed to provision workspace", slog.String("workspace_id", workspaceID), slog.Any("error", err))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Provisioning failed: %v", err)})
+				return
+			}
+		} else {
+			slog.Warn("Relational DB is offline, skipping actual provisioning", slog.String("workspace_id", workspaceID))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Database subsystem offline"})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "success",
+			"message": "Wallet provisioned successfully",
+		})
+	})
+
 	// =========================================================================
 	// 🛡️ THE PRODUCTION SERVER ENGINE & GRACEFUL SHUTDOWN
 	// =========================================================================
