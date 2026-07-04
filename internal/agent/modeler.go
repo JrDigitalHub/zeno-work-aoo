@@ -1,11 +1,16 @@
 package agent
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/memory"
@@ -168,16 +173,127 @@ func (f *FinancialModeler) HandleIngestInvoice(w http.ResponseWriter, r *http.Re
 		http.Error(w, `{"error": "Unauthorized. Missing workspace context."}`, http.StatusUnauthorized)
 		return
 	}
+	workspaceID := fmt.Sprintf("%v", ctxWorkspace)
 
-	// 1. In a full production setup, parse the multipart/form-data PDF upload here
-	// 2. Send the raw text/image to Gemini Flash via your Oracle agent
-	// 3. Gemini returns structured JSON (Vendor, Amount, Tax)
-	// 4. Pass that JSON into f.DB.LogDoubleEntry()
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error": "Method not allowed. Use POST."}`, http.StatusMethodNotAllowed)
+		return
+	}
 
-	// For now, we return a mock success to verify the API pipeline connection
-	log.Println("🧾 [CFO] Invoice ingestion endpoint hit. Awaiting OCR integration.")
+	if f.DB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Database subsystem offline"})
+		return
+	}
 
+	// Parse the raw payload wrapper
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, `{"error": "Failed to read request body"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Generate a unique cryptographically safe job ID
+	jobBytes := make([]byte, 16)
+	_, _ = rand.Read(jobBytes)
+	jobID := hex.EncodeToString(jobBytes)
+
+	// Write PENDING state to database
+	if err := f.DB.CreateBackgroundJob(jobID, workspaceID); err != nil {
+		slog.Error("Failed to create background job", slog.String("job_id", jobID), slog.Any("error", err))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Failed to initialize background job: %v", err)})
+		return
+	}
+
+	// Launch background worker goroutine to process the invoice asynchronously
+	go f.processInvoiceAsync(jobID, workspaceID, bodyBytes)
+
+	// Instantly return 202 Accepted status with job_id
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	w.Write([]byte(`{"status": "PROCESSING", "message": "Invoice received for OCR extraction."}`))
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "queued",
+		"job_id": jobID,
+	})
 }
+
+// processInvoiceAsync executes the resource-heavy task in a background goroutine
+func (f *FinancialModeler) processInvoiceAsync(jobID string, workspaceID string, payload []byte) {
+	// 1. Update status to PROCESSING
+	_ = f.DB.UpdateJobStatus(jobID, "PROCESSING", "")
+
+	// 2. Simulate resource-heavy AI OCR processing (sleep for 3 seconds)
+	time.Sleep(3 * time.Second)
+
+	// Mock structured response from OCR/Agent parsing
+	resultData := map[string]interface{}{
+		"vendor":       "Zeno Cloud Services",
+		"amount":       1500.0,
+		"tax":          120.0,
+		"status":       "PROCESSED",
+		"processed_at": time.Now().Format(time.RFC3339),
+	}
+	resultBytes, _ := json.Marshal(resultData)
+
+	// Record a double entry to log the outcome of the job
+	_ = f.DB.LogDoubleEntry(workspaceID, "EXPENSE", "CASH", 1500.0, "AI OCR Ingested: Zeno Cloud Services", jobID)
+
+	// 3. Save outcome as COMPLETED
+	err := f.DB.UpdateJobStatus(jobID, "COMPLETED", string(resultBytes))
+	if err != nil {
+		slog.Error("Failed to update background job status to COMPLETED", slog.String("job_id", jobID), slog.Any("error", err))
+	}
+}
+
+// HandleGetJobStatus serves GET /api/v1/cfo/jobs/{id}
+func (f *FinancialModeler) HandleGetJobStatus(w http.ResponseWriter, r *http.Request) {
+	ctxWorkspace := r.Context().Value("workspace_id")
+	if ctxWorkspace == nil {
+		http.Error(w, `{"error": "Unauthorized. Missing workspace context."}`, http.StatusUnauthorized)
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error": "Method not allowed. Use GET."}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	if f.DB == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Database subsystem offline"})
+		return
+	}
+
+	// Extract job ID from the URL path (e.g. /api/v1/cfo/jobs/xyz)
+	parts := strings.Split(r.URL.Path, "/")
+	jobID := parts[len(parts)-1]
+	jobID = strings.TrimSpace(jobID)
+
+	if jobID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Job ID is required"})
+		return
+	}
+
+	status, result, err := f.DB.GetJobStatus(jobID)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Job not found: %v", err)})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"job_id": jobID,
+		"status": status,
+		"result": result,
+	})
+}
+

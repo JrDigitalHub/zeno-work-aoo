@@ -110,3 +110,41 @@ func (r *RelationalStore) ProvisionNewWorkspace(workspaceID string, email string
 	return nil
 }
 
+// UpgradeWorkspaceTier updates the subscription tier and replenishes the token balance under a FOR UPDATE lock transaction.
+func (r *RelationalStore) UpgradeWorkspaceTier(workspaceID string, newTier string, tokensToAdd int) error {
+	return r.ExecuteTransaction(func(tx *sql.Tx) error {
+		var balance int
+		var currentTier string
+
+		// Lock row for update
+		selectQuery := `SELECT token_balance, subscription_tier FROM workspaces WHERE id = $1 FOR UPDATE`
+		err := tx.QueryRow(selectQuery, workspaceID).Scan(&balance, &currentTier)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				// Workspace doesn't exist, create it with default initial tokens + upgrade tokens
+				insertQuery := `
+					INSERT INTO workspaces (id, name, is_paused, token_balance, subscription_tier)
+					VALUES ($1, $2, FALSE, $3, $4)
+					ON CONFLICT (id) DO NOTHING
+				`
+				name := "Workspace " + workspaceID
+				_, err = tx.Exec(insertQuery, workspaceID, name, 50000+tokensToAdd, newTier)
+				if err != nil {
+					return fmt.Errorf("failed to create wallet during upgrade: %v", err)
+				}
+				return nil
+			}
+			return err
+		}
+
+		newBalance := balance + tokensToAdd
+		updateQuery := `UPDATE workspaces SET token_balance = $1, subscription_tier = $2 WHERE id = $3`
+		_, err = tx.Exec(updateQuery, newBalance, newTier, workspaceID)
+		if err != nil {
+			return fmt.Errorf("failed to upgrade workspace: %v", err)
+		}
+		return nil
+	})
+}
+
+

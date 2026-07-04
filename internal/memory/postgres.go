@@ -68,6 +68,20 @@ func NewRelationalStore(connectionString string) (*RelationalStore, error) {
 		return nil, fmt.Errorf("failed to initialize workspaces schema: %v", err)
 	}
 
+	jobsSchema := `
+	CREATE TABLE IF NOT EXISTS background_jobs (
+		id VARCHAR(255) PRIMARY KEY,
+		workspace_id VARCHAR(255) NOT NULL,
+		status VARCHAR(50) NOT NULL DEFAULT 'PENDING',
+		result TEXT,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+	`
+	_, err = db.Exec(jobsSchema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize background_jobs schema: %v", err)
+	}
+
 	fmt.Println("🗄️ [Supabase] Relational state ledger connected and verified (Pooled).")
 	return &RelationalStore{DB: db}, nil
 }

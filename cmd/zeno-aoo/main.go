@@ -3,13 +3,20 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/sha512"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -232,6 +239,24 @@ func main() {
 
 		if r.Method == http.MethodPost {
 			modelerAgent.HandleIngestInvoice(w, r)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+
+	// GET /api/v1/cfo/jobs/{id} - Secure polling endpoint for background jobs
+	http.HandleFunc("/api/v1/cfo/jobs/", middleware.EngineSecurityGuard(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method == http.MethodGet {
+			modelerAgent.HandleGetJobStatus(w, r)
 		} else {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
@@ -704,6 +729,337 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{
 			"status":  "success",
 			"message": "Wallet provisioned successfully",
+		})
+	})
+
+	// 👉 Paystack Webhook (Unauthenticated, protected by x-paystack-signature header verification)
+	http.HandleFunc("/api/v1/webhooks/paystack", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, x-paystack-signature")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+			return
+		}
+
+		// Security Check (CRITICAL)
+		secret := os.Getenv("PAYSTACK_SECRET_KEY")
+		receivedSignature := r.Header.Get("x-paystack-signature")
+
+		// Read the raw request body
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read request body"})
+			return
+		}
+		// Restore body for any subsequent parsing if needed
+		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+		// Compute HMAC SHA512 of raw bodyBytes
+		h := hmac.New(sha512.New, []byte(secret))
+		h.Write(bodyBytes)
+		expectedSignature := hex.EncodeToString(h.Sum(nil))
+
+		// Validate signature (compare received signature against expectedSignature)
+		if secret == "" || receivedSignature == "" || !hmac.Equal([]byte(receivedSignature), []byte(expectedSignature)) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized. Invalid signature."})
+			return
+		}
+
+		// Paystack event payload struct definitions
+		type PaystackMetadata struct {
+			WorkspaceID string `json:"workspace_id"`
+		}
+		type PaystackData struct {
+			Amount   int              `json:"amount"`
+			Metadata PaystackMetadata `json:"metadata"`
+		}
+		type PaystackWebhookEvent struct {
+			Event string       `json:"event"`
+			Data  PaystackData `json:"data"`
+		}
+
+		var event PaystackWebhookEvent
+		if err := json.Unmarshal(bodyBytes, &event); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request payload"})
+			return
+		}
+
+		// Listen specifically for the charge.success event
+		if event.Event != "charge.success" {
+			// Acknowledge other events with 200 OK without upgrading
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "ignored", "message": "Event is not charge.success"})
+			return
+		}
+
+		workspaceID := strings.TrimSpace(event.Data.Metadata.WorkspaceID)
+		amount := event.Data.Amount
+
+		if workspaceID == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid payload: missing workspace_id in metadata"})
+			return
+		}
+
+		// Determine new tier and tokens to add based on the amount paid (in kobo)
+		var newTier string
+		var tokensToAdd int
+
+		switch amount {
+		case 1499900: // Starter Plan: ₦14,999 -> 500,000 tokens
+			newTier = "Starter"
+			tokensToAdd = 500000
+		case 9999900: // Pro Plan: ₦99,999 -> 2,000,000 tokens
+			newTier = "Professional"
+			tokensToAdd = 2000000
+		default:
+			slog.Warn("Received charge.success with unexpected amount", slog.Int("amount", amount), slog.String("workspace_id", workspaceID))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Unexpected payment amount: %d", amount)})
+			return
+		}
+
+		if relationalBrain != nil {
+			if err := relationalBrain.UpgradeWorkspaceTier(workspaceID, newTier, tokensToAdd); err != nil {
+				slog.Error("Failed to upgrade workspace tier", slog.String("workspace_id", workspaceID), slog.String("tier", newTier), slog.Any("error", err))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Upgrade failed: %v", err)})
+				return
+			}
+		} else {
+			slog.Warn("Relational DB is offline, skipping actual upgrade", slog.String("workspace_id", workspaceID))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Database subsystem offline"})
+			return
+		}
+
+		slog.Info("Successfully upgraded workspace tier via Paystack", slog.String("workspace_id", workspaceID), slog.String("tier", newTier), slog.Int("tokens_added", tokensToAdd))
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "success",
+			"message": "Subscription upgraded successfully",
+		})
+	})
+
+	// 👉 Polar Webhook (Unauthenticated, protected by Standard Webhooks / Svix signature verification)
+	http.HandleFunc("/api/v1/webhooks/polar", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, webhook-id, webhook-timestamp, webhook-signature, svix-id, svix-timestamp, svix-signature")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+			return
+		}
+
+		// Security Check (CRITICAL)
+		webhookID := r.Header.Get("webhook-id")
+		if webhookID == "" {
+			webhookID = r.Header.Get("svix-id")
+		}
+		webhookTimestamp := r.Header.Get("webhook-timestamp")
+		if webhookTimestamp == "" {
+			webhookTimestamp = r.Header.Get("svix-timestamp")
+		}
+		webhookSignatureHeader := r.Header.Get("webhook-signature")
+		if webhookSignatureHeader == "" {
+			webhookSignatureHeader = r.Header.Get("svix-signature")
+		}
+
+		if webhookID == "" || webhookTimestamp == "" || webhookSignatureHeader == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusPointToRedirect) // Redirect or unauthorized is fine, standard says 401
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized. Missing signature headers."})
+			return
+		}
+
+		// Replay Attack Protection (5 minutes skew window)
+		timestampInt, err := strconv.ParseInt(webhookTimestamp, 10, 64)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid webhook timestamp"})
+			return
+		}
+		now := time.Now().Unix()
+		diff := now - timestampInt
+		if diff < -300 || diff > 300 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized. Request expired or timestamp skew too large."})
+			return
+		}
+
+		// Read the raw request body
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read request body"})
+			return
+		}
+		// Restore body for any subsequent parsing
+		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+		// Decode the webhook secret
+		secret := os.Getenv("POLAR_WEBHOOK_SECRET")
+		secret = strings.TrimPrefix(secret, "whsec_")
+		key, err := base64.StdEncoding.DecodeString(secret)
+		if err != nil {
+			key = []byte(secret)
+		}
+
+		// Compute HMAC SHA256 of: id.timestamp.body
+		signedContent := fmt.Sprintf("%s.%s.%s", webhookID, webhookTimestamp, string(bodyBytes))
+		h := hmac.New(sha256.New, key)
+		h.Write([]byte(signedContent))
+		calculatedSignature := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+		// Compare computed signature against signature header list (delimited by spaces)
+		parts := strings.Split(webhookSignatureHeader, " ")
+		var matched bool
+		for _, part := range parts {
+			subParts := strings.Split(part, ",")
+			if len(subParts) == 2 && subParts[0] == "v1" {
+				receivedSig := subParts[1]
+				if hmac.Equal([]byte(receivedSig), []byte(calculatedSignature)) {
+					matched = true
+					break
+				}
+			}
+		}
+
+		if !matched {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized. Invalid signature."})
+			return
+		}
+
+		// Struct to decode the incoming payload dynamically
+		type PolarMetadata struct {
+			WorkspaceID string `json:"workspace_id"`
+		}
+		type PolarCustomFieldData struct {
+			WorkspaceID string `json:"workspace_id"`
+		}
+		type PolarData struct {
+			Amount          int                  `json:"amount"`
+			PriceAmount     int                  `json:"price_amount"`
+			Metadata        PolarMetadata        `json:"metadata"`
+			CustomFieldData PolarCustomFieldData `json:"custom_field_data"`
+		}
+		type PolarWebhookEvent struct {
+			Type string    `json:"type"`
+			Data PolarData `json:"data"`
+		}
+
+		var event PolarWebhookEvent
+		if err := json.Unmarshal(bodyBytes, &event); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request payload"})
+			return
+		}
+
+		// Listen specifically for subscription.created or subscription.updated
+		if event.Type != "subscription.created" && event.Type != "subscription.updated" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "ignored", "message": "Event is not handled"})
+			return
+		}
+
+		// Extract workspace_id (prioritize metadata, fallback to custom_field_data)
+		workspaceID := strings.TrimSpace(event.Data.Metadata.WorkspaceID)
+		if workspaceID == "" {
+			workspaceID = strings.TrimSpace(event.Data.CustomFieldData.WorkspaceID)
+		}
+
+		if workspaceID == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid payload: missing workspace_id"})
+			return
+		}
+
+		// Extract amount (cents)
+		amount := event.Data.Amount
+		if amount == 0 {
+			amount = event.Data.PriceAmount
+		}
+
+		var newTier string
+		var tokensToAdd int
+
+		switch amount {
+		case 1900: // Starter Plan: $19 -> 500,000 tokens
+			newTier = "Starter"
+			tokensToAdd = 500000
+		case 9900: // Professional Plan: $99 -> 2,000,000 tokens
+			newTier = "Professional"
+			tokensToAdd = 2000000
+		default:
+			slog.Warn("Received Polar subscription event with unexpected amount", slog.Int("amount", amount), slog.String("workspace_id", workspaceID))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Unexpected payment amount: %d", amount)})
+			return
+		}
+
+		if relationalBrain != nil {
+			if err := relationalBrain.UpgradeWorkspaceTier(workspaceID, newTier, tokensToAdd); err != nil {
+				slog.Error("Failed to upgrade workspace tier via Polar", slog.String("workspace_id", workspaceID), slog.String("tier", newTier), slog.Any("error", err))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Upgrade failed: %v", err)})
+				return
+			}
+		} else {
+			slog.Warn("Relational DB is offline, skipping actual upgrade", slog.String("workspace_id", workspaceID))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Database subsystem offline"})
+			return
+		}
+
+		slog.Info("Successfully upgraded workspace tier via Polar", slog.String("workspace_id", workspaceID), slog.String("tier", newTier), slog.Int("tokens_added", tokensToAdd))
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status":  "success",
+			"message": "Subscription processed successfully",
 		})
 	})
 
