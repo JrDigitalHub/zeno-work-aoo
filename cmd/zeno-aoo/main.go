@@ -68,9 +68,9 @@ func main() {
 
 	graphBrain, err := memory.NewSovereignStore(neo4jURI, neo4jUser, neo4jPass)
 	if err != nil {
-		panic(fmt.Sprintf("❌ CRITICAL: Failed to boot Graph Memory: %v", err))
-	}
-	defer graphBrain.Close()
+		fmt.Printf("⚠️ WARNING: Graph Memory offline. Bypassing for frontend development: %v\n", err)
+	} else {
+		defer graphBrain.Close()
 	fmt.Println("🧠 [MEMORY] Neural Graph (Neo4j) connected successfully.")
 
 	// 2. Ignite Qdrant (NOW CLOUD READY)
