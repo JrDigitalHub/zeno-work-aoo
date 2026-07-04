@@ -72,6 +72,7 @@ func main() {
 	} else {
 		defer graphBrain.Close()
 	fmt.Println("🧠 [MEMORY] Neural Graph (Neo4j) connected successfully.")
+	}
 
 	// 2. Ignite Qdrant (NOW CLOUD READY)
 	qdrantURL := os.Getenv("QDRANT_URL")
