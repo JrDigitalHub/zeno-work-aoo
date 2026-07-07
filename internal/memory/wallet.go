@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
+
+	"github.com/lib/pq"
 )
 
 // GetTokenWallet returns the token balance and subscription tier for a given workspace.
@@ -124,7 +127,11 @@ func (r *RelationalStore) UpgradeWorkspaceTier(ctx context.Context, workspaceID 
 			`
 			_, err := tx.ExecContext(ctx, insertJournal, workspaceID, "REVENUE", "CREDIT", float64(tokensToAdd), "Workspace Subscription Upgrade to "+newTier, referenceID)
 			if err != nil {
-				return fmt.Errorf("duplicate upgrade request (reference %s): %w", referenceID, err)
+				if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" && pgErr.Constraint == "unique_workspace_reference" {
+					slog.Info("duplicate webhook replay, no-op", slog.String("workspace_id", workspaceID), slog.String("reference_id", referenceID))
+					return nil
+				}
+				return fmt.Errorf("failed to log upgrade transaction: %w", err)
 			}
 		}
 

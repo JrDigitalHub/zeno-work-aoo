@@ -146,7 +146,11 @@ func (r *EventRouter) Publish(ctx context.Context, e protocol.Event) error {
 			Timestamp:   e.Timestamp,
 		}
 	default:
-		slog.Warn("Unregistered event source, executing inline", slog.String("source", e.Source))
+		env := os.Getenv("APP_ENV")
+		if env == "production" || env == "prod" {
+			return fmt.Errorf("unregistered event source %s in production environment; cannot publish event", e.Source)
+		}
+		slog.Warn("Unregistered event source, executing inline (development fallback)", slog.String("source", e.Source))
 		return r.Dispatch(ctx, e)
 	}
 
@@ -207,7 +211,11 @@ func (r *EventRouter) PublishTx(ctx context.Context, tx *sql.Tx, e protocol.Even
 			Timestamp:   e.Timestamp,
 		}
 	default:
-		slog.Warn("Unregistered event source in tx, executing inline", slog.String("source", e.Source))
+		env := os.Getenv("APP_ENV")
+		if env == "production" || env == "prod" {
+			return fmt.Errorf("unregistered event source %s in production environment; cannot publish event in tx", e.Source)
+		}
+		slog.Warn("Unregistered event source in tx, executing inline (development fallback)", slog.String("source", e.Source))
 		return r.Dispatch(ctx, e)
 	}
 
