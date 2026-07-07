@@ -1,6 +1,7 @@
 package comms
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -112,7 +113,7 @@ func (w *WebSocketEngine) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 }
 
 // React intercepts live system events from the central EventRouter and translates them to WebSocket broadcasts.
-func (w *WebSocketEngine) React(event protocol.Event) {
+func (w *WebSocketEngine) React(ctx context.Context, event protocol.Event) error {
 	switch event.Source {
 	case "DISCOVERY":
 		w.Broadcast <- SystemStatePayload{
@@ -127,8 +128,9 @@ func (w *WebSocketEngine) React(event protocol.Event) {
 			Data:      event.Payload,
 		}
 	default:
-		return
+		return nil
 	}
+	return nil
 }
 
 // writePump drains outbound messages from the client's internal pipeline and pushes them to the socket.

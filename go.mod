@@ -8,6 +8,8 @@ require (
 	github.com/lib/pq v1.12.3
 	github.com/neo4j/neo4j-go-driver/v5 v5.28.4
 	github.com/qdrant/go-client v1.18.1
+	github.com/riverqueue/river v0.39.0
+	github.com/riverqueue/river/riverdriver/riverdatabasesql v0.39.0
 )
 
 require (

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,9 +26,9 @@ func NewPredator(router *orchestrator.EventRouter) *Predator {
 }
 
 // React listens to the Event Bus for targets identified by the Discovery Agent
-func (p *Predator) React(event protocol.Event) {
+func (p *Predator) React(ctx context.Context, event protocol.Event) error {
 	if event.Source != "DISCOVERY" {
-		return
+		return nil
 	}
 
 	fmt.Printf("🦅 [PREDATOR] Target locked for Workspace [%s]. Parsing enriched payload...\n", event.WorkspaceID)
@@ -35,7 +36,7 @@ func (p *Predator) React(event protocol.Event) {
 	urlTarget := p.extractURL(event.Payload)
 	if urlTarget == "" {
 		fmt.Printf("⚠️ [PREDATOR] No valid URL found in payload for Workspace [%s]. Aborting strike.\n", event.WorkspaceID)
-		return
+		return nil
 	}
 
 	fmt.Printf("🦅 [PREDATOR] Initiating Deep-Crawl on %s...\n", urlTarget)
@@ -56,10 +57,10 @@ func (p *Predator) React(event protocol.Event) {
 		Transport: transport,
 	}
 
-	req, err := http.NewRequest("GET", urlTarget, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", urlTarget, nil)
 	if err != nil {
 		fmt.Printf("❌ [PREDATOR] Failed to build HTTP request for %s: %v\n", urlTarget, err)
-		return
+		return err
 	}
 
 	// Disguise the agent as a standard Chrome browser
@@ -68,14 +69,14 @@ func (p *Predator) React(event protocol.Event) {
 	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Printf("❌ [PREDATOR] Connection refused by %s: %v\n", urlTarget, err)
-		return
+		return err
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		fmt.Printf("❌ [PREDATOR] Failed to read HTML DOM from %s: %v\n", urlTarget, err)
-		return
+		return err
 	}
 	htmlContent := string(bodyBytes)
 
@@ -83,14 +84,14 @@ func (p *Predator) React(event protocol.Event) {
 	email := p.scrapeEmail(htmlContent)
 	if email == "" {
 		fmt.Printf("⚠️ [PREDATOR] Crawl completed on %s. No public email address exposed in DOM.\n", urlTarget)
-		return
+		return nil
 	}
 
 	fmt.Printf("🎯 [PREDATOR] SUCCESS! Email extracted from %s: %s\n", urlTarget, email)
 
 	finalPayload := fmt.Sprintf("%s | EMAIL: %s", event.Payload, email)
 
-	p.router.Publish(protocol.Event{
+	return p.router.Publish(ctx, protocol.Event{
 		WorkspaceID: event.WorkspaceID,
 		ID:          email,
 		Source:      "PREDATOR",

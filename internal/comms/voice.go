@@ -2,6 +2,7 @@ package comms
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,32 +25,40 @@ func NewVoiceEngine(whisperURL, styleTTSURL string) *VoiceEngine {
 }
 
 // React listens to the bus. When text context drops, it triggers StyleTTS2 speech generation.
-func (v *VoiceEngine) React(e protocol.Event) {
+func (v *VoiceEngine) React(ctx context.Context, e protocol.Event) error {
 	if e.Source == "SENTINEL_TEXT_OUTPUT" {
 		fmt.Printf("🎙️ [VOICE-ENGINE] Intercepted raw text strategy for [%s]. Initiating StyleTTS2 synthesis...\n", e.ID)
 		
 		outputFile := "outbound_outreach.mp3"
-		err := v.Synthesize(e.Payload, outputFile)
+		err := v.Synthesize(ctx, e.Payload, outputFile)
 		if err != nil {
 			fmt.Printf("❌ [VOICE-ENGINE] Synthesis transaction failed: %v\n", err)
-			return
+			return err
 		}
 		fmt.Printf("🔊 [VOICE-ENGINE] Sovereign Audio master baked successfully: %s\n", outputFile)
 	}
+	return nil
 }
 
 // Synthesize sends the text string to your high-fidelity local StyleTTS2 instance
-func (v *VoiceEngine) Synthesize(text, outputPath string) error {
+func (v *VoiceEngine) Synthesize(ctx context.Context, text, outputPath string) error {
 	// Standard production payload format for local StyleTTS2 inference microservices
 	payload := map[string]string{
 		"text": text,
 	}
 	jsonPayload, _ := json.Marshal(payload)
 
-	resp, err := http.Post(v.styleTTSURL+"/generate", "application/json", bytes.NewBuffer(jsonPayload))
+	req, err := http.NewRequestWithContext(ctx, "POST", v.styleTTSURL+"/generate", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		// Fallback diagnostic if your local docker container isn't running yet
-		return fmt.Errorf("local StyleTTS2 server unreachable on %s", v.styleTTSURL)
+		return fmt.Errorf("local StyleTTS2 server unreachable on %s: %w", v.styleTTSURL, err)
 	}
 	defer resp.Body.Close()
 

@@ -31,6 +31,9 @@ import (
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/middleware"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/orchestrator"
 	"github.com/JrDigitalHub/zeno-work-aoo/pkg/protocol"
+	"github.com/riverqueue/river"
+	"github.com/riverqueue/river/riverdriver/riverdatabasesql"
+	"github.com/riverqueue/river/rivermigrate"
 )
 
 // 👉 Global Master Kill Switch State
@@ -97,6 +100,7 @@ func main() {
 	// 2.5 Ignite Relational Brain (Supabase / Postgres)
 	var relationalBrain *memory.RelationalStore
 	var dbConn *sql.DB // Safely extract the *sql.DB for the COO service
+	var riverClient *river.Client
 
 	supabaseURL := os.Getenv("SUPABASE_URL")
 	if supabaseURL == "" {
@@ -109,6 +113,16 @@ func main() {
 		relationalBrain = store
 		dbConn = store.DB
 		defer relationalBrain.Close()
+
+		// Run River schema migrations at startup
+		slog.Info("Running River migrations...")
+		driver := riverdatabasesql.New(dbConn)
+		migrator := rivermigrate.NewMigrator(driver, nil)
+		_, err = migrator.Migrate(context.Background(), rivermigrate.DirectionUp, nil)
+		if err != nil {
+			panic(fmt.Sprintf("❌ CRITICAL: Failed to run River migrations: %v", err))
+		}
+		slog.Info("River migrations completed successfully.")
 	}
 
 	// 3. Initialize Back-Office (Enterprise Multi-Tenant Mode)
@@ -143,8 +157,8 @@ func main() {
 		"JR Digital Hub | System",
 		relationalBrain,
 	)
-	router.Subscribe(func(event protocol.Event) {
-		emailEngine.React(event)
+	router.Subscribe(func(ctx context.Context, event protocol.Event) error {
+		return emailEngine.React(ctx, event)
 	})
 
 	// 7.7. Initialize Real-Time WebSocket State Engine
@@ -158,6 +172,44 @@ func main() {
 	// 8.5 Initialize Financial Modeler
 	modelerAgent := agent.NewFinancialModeler(router, relationalBrain)
 	router.Subscribe(modelerAgent.React)
+
+	// --- BOOT RIVER BACKGROUND JOB CLIENT ---
+	if dbConn != nil {
+		slog.Info("Starting River background job engine...")
+		driver := riverdatabasesql.New(dbConn)
+		workers := river.NewWorkers()
+
+		river.AddWorker(workers, &orchestrator.DiscoveryWorker{Router: router})
+		river.AddWorker(workers, &orchestrator.PredatorWorker{Router: router})
+		river.AddWorker(workers, &orchestrator.SentinelTextOutputWorker{Router: router})
+		river.AddWorker(workers, &orchestrator.ModelerResultWorker{Router: router})
+		river.AddWorker(workers, &agent.ProcessInvoiceWorker{Modeler: modelerAgent})
+		river.AddWorker(workers, &orchestrator.UpgradeWorkspaceWorker{DB: relationalBrain})
+
+		client, err := river.NewClient(driver, &river.Config{
+			Queues: map[string]river.QueueConfig{
+				river.QueueDefault: {MaxWorkers: 10},
+				"discovery":        {MaxWorkers: 10},
+				"predator":         {MaxWorkers: 10},
+				"sentinel":         {MaxWorkers: 10},
+				"modeler":          {MaxWorkers: 10},
+				"wallet":           {MaxWorkers: 5},
+			},
+			Workers: workers,
+		})
+		if err != nil {
+			panic(fmt.Sprintf("❌ CRITICAL: Failed to initialize River client: %v", err))
+		}
+		riverClient = client
+
+		// Pass the client to the router
+		router.SetRiverClient(riverClient)
+
+		if err := riverClient.Start(context.Background()); err != nil {
+			panic(fmt.Sprintf("❌ CRITICAL: Failed to start River client: %v", err))
+		}
+		slog.Info("River background job engine online.")
+	}
 
 	// --- ENTERPRISE HTTP ROUTING --- //
 
@@ -783,8 +835,9 @@ func main() {
 			WorkspaceID string `json:"workspace_id"`
 		}
 		type PaystackData struct {
-			Amount   int              `json:"amount"`
-			Metadata PaystackMetadata `json:"metadata"`
+			Amount    int              `json:"amount"`
+			Reference string           `json:"reference"`
+			Metadata  PaystackMetadata `json:"metadata"`
 		}
 		type PaystackWebhookEvent struct {
 			Event string       `json:"event"`
@@ -810,6 +863,7 @@ func main() {
 
 		workspaceID := strings.TrimSpace(event.Data.Metadata.WorkspaceID)
 		amount := event.Data.Amount
+		reference := event.Data.Reference
 
 		if workspaceID == "" {
 			w.Header().Set("Content-Type", "application/json")
@@ -837,9 +891,25 @@ func main() {
 			return
 		}
 
-		if relationalBrain != nil {
-			if err := relationalBrain.UpgradeWorkspaceTier(workspaceID, newTier, tokensToAdd); err != nil {
-				slog.Error("Failed to upgrade workspace tier", slog.String("workspace_id", workspaceID), slog.String("tier", newTier), slog.Any("error", err))
+		if riverClient != nil {
+			_, err = riverClient.Insert(r.Context(), orchestrator.UpgradeWorkspaceJobArgs{
+				WorkspaceID: workspaceID,
+				NewTier:     newTier,
+				TokensToAdd: tokensToAdd,
+				ReferenceID: reference,
+			}, nil)
+			if err != nil {
+				slog.Error("Failed to enqueue UpgradeWorkspaceJob in River via Paystack", slog.String("workspace_id", workspaceID), slog.Any("error", err))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Failed to queue upgrade"})
+				return
+			}
+		} else if relationalBrain != nil {
+			slog.Warn("River client is offline, falling back to synchronous execution")
+			ctx := context.WithValue(r.Context(), memory.WorkspaceIDKey, workspaceID)
+			if err := relationalBrain.UpgradeWorkspaceTier(ctx, workspaceID, newTier, tokensToAdd, reference); err != nil {
+				slog.Error("Failed to upgrade workspace tier synchronously", slog.String("workspace_id", workspaceID), slog.String("tier", newTier), slog.Any("error", err))
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
 				json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Upgrade failed: %v", err)})
@@ -1037,9 +1107,25 @@ func main() {
 			return
 		}
 
-		if relationalBrain != nil {
-			if err := relationalBrain.UpgradeWorkspaceTier(workspaceID, newTier, tokensToAdd); err != nil {
-				slog.Error("Failed to upgrade workspace tier via Polar", slog.String("workspace_id", workspaceID), slog.String("tier", newTier), slog.Any("error", err))
+		if riverClient != nil {
+			_, err = riverClient.Insert(r.Context(), orchestrator.UpgradeWorkspaceJobArgs{
+				WorkspaceID: workspaceID,
+				NewTier:     newTier,
+				TokensToAdd: tokensToAdd,
+				ReferenceID: webhookID,
+			}, nil)
+			if err != nil {
+				slog.Error("Failed to enqueue UpgradeWorkspaceJob in River via Polar", slog.String("workspace_id", workspaceID), slog.Any("error", err))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Failed to queue upgrade"})
+				return
+			}
+		} else if relationalBrain != nil {
+			slog.Warn("River client is offline, falling back to synchronous execution")
+			ctx := context.WithValue(r.Context(), memory.WorkspaceIDKey, workspaceID)
+			if err := relationalBrain.UpgradeWorkspaceTier(ctx, workspaceID, newTier, tokensToAdd, webhookID); err != nil {
+				slog.Error("Failed to upgrade workspace tier synchronously via Polar", slog.String("workspace_id", workspaceID), slog.String("tier", newTier), slog.Any("error", err))
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
 				json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Upgrade failed: %v", err)})
@@ -1100,9 +1186,18 @@ func main() {
 	<-quit
 	slog.Info("🛑 [SYSTEM] SIGTERM received. Initiating graceful shutdown sequence...")
 
-	// 6. Give the CFO and database 10 seconds to finish writing transactions
+	// 6. Give the CFO, background jobs, and database 10 seconds to finish writing transactions
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	if riverClient != nil {
+		slog.Info("🛑 Stopping River background job client...")
+		if err := riverClient.Stop(ctx); err != nil {
+			slog.Error("River client forced to stop", slog.Any("error", err))
+		} else {
+			slog.Info("River client stopped successfully.")
+		}
+	}
 
 	if err := srv.Shutdown(ctx); err != nil {
 		slog.Error("Server forced to shutdown", slog.Any("error", err))
