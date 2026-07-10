@@ -90,17 +90,19 @@ func main() {
 		qdrantURL = "localhost:6334"
 	}
 
-	vectorBrain, err := memory.NewVectorStore(qdrantURL, "zeno_intel_vectors_v3")
+	var vectorBrain *memory.VectorStore
+	vectorBrain, err = memory.NewVectorStore(qdrantURL, "zeno_intel_vectors_v3")
 	if err != nil {
-		panic(fmt.Sprintf("❌ CRITICAL: Failed to boot Vector Memory: %v", err))
+		fmt.Printf("⚠️ WARNING: Vector Memory offline. Bypassing for frontend development: %v\n", err)
+	} else {
+		defer vectorBrain.Close()
+		fmt.Println("📐 [VECTOR] Semantic Memory connected successfully.")
 	}
-	defer vectorBrain.Close()
-	fmt.Println("📐 [VECTOR] Semantic Memory connected successfully.")
 
 	// 2.5 Ignite Relational Brain (Supabase / Postgres)
 	var relationalBrain *memory.RelationalStore
 	var dbConn *sql.DB // Safely extract the *sql.DB for the COO service
-	var riverClient *river.Client
+	var riverClient *river.Client[*sql.Tx]
 
 	supabaseURL := os.Getenv("SUPABASE_URL")
 	if supabaseURL == "" {
@@ -117,7 +119,10 @@ func main() {
 		// Run River schema migrations at startup
 		slog.Info("Running River migrations...")
 		driver := riverdatabasesql.New(dbConn)
-		migrator := rivermigrate.NewMigrator(driver, nil)
+		migrator, err := rivermigrate.New(driver, nil)
+		if err != nil {
+			panic(fmt.Sprintf("❌ CRITICAL: Failed to initialize River migrator: %v", err))
+		}
 		_, err = migrator.Migrate(context.Background(), rivermigrate.DirectionUp, nil)
 		if err != nil {
 			panic(fmt.Sprintf("❌ CRITICAL: Failed to run River migrations: %v", err))
@@ -349,7 +354,7 @@ func main() {
 		var err error
 
 		if relationalBrain != nil {
-			balance, tier, err = relationalBrain.GetTokenWallet(workspaceID)
+			balance, tier, err = relationalBrain.GetTokenWallet(r.Context(), workspaceID)
 			if err != nil {
 				http.Error(w, fmt.Sprintf(`{"error": "Failed to fetch wallet: %v"}`, err), http.StatusInternalServerError)
 				return
@@ -414,7 +419,7 @@ func main() {
 		var newBalance int
 		if relationalBrain != nil {
 			var err error
-			newBalance, err = relationalBrain.DeductTokens(workspaceID, 150)
+			newBalance, err = relationalBrain.DeductTokens(r.Context(), workspaceID, 150)
 			if err != nil {
 				if strings.Contains(err.Error(), "insufficient tokens") {
 					w.Header().Set("Content-Type", "application/json")
@@ -651,7 +656,7 @@ func main() {
 		fmt.Printf("\n⚡ [API] Directive Received for Workspace [%s]: '%s' via %s. Rerouting...\n", req.WorkspaceID, req.Target, req.Mode)
 
 		// 👉 Send the request securely to the multi-vector Discovery Engine
-		go discoveryAgent.ExtractLeads(req.WorkspaceID, req.Target, req.Mode)
+		go discoveryAgent.ExtractLeads(context.Background(), req.WorkspaceID, req.Target, req.Mode)
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "Directive Engaged", "workspace_id": req.WorkspaceID, "mode": req.Mode})
@@ -678,7 +683,7 @@ func main() {
 			return
 		}
 
-		opsManager.Ingest(req.WorkspaceID, req.Source, req.Payload)
+		opsManager.Ingest(r.Context(), req.WorkspaceID, req.Source, req.Payload)
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ZENO_ACKNOWLEDGED", "workspace_id": req.WorkspaceID})
@@ -761,7 +766,7 @@ func main() {
 		}
 
 		if relationalBrain != nil {
-			if err := relationalBrain.ProvisionNewWorkspace(workspaceID, email); err != nil {
+			if err := relationalBrain.ProvisionNewWorkspace(r.Context(), workspaceID, email); err != nil {
 				slog.Error("Failed to provision workspace", slog.String("workspace_id", workspaceID), slog.Any("error", err))
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
@@ -967,7 +972,6 @@ func main() {
 
 		if webhookID == "" || webhookTimestamp == "" || webhookSignatureHeader == "" {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusPointToRedirect) // Redirect or unauthorized is fine, standard says 401
 			w.WriteHeader(http.StatusUnauthorized)
 			json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized. Missing signature headers."})
 			return

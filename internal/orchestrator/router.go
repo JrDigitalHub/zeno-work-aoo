@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
 	"log/slog"
 	"os"
 	"sync"
@@ -20,7 +19,7 @@ type EventHandler func(ctx context.Context, event protocol.Event) error
 
 type EventRouter struct {
 	client      *redis.Client // Keep for cache/session fallback compatibility if needed
-	riverClient *river.Client
+	riverClient *river.Client[*sql.Tx]
 	subscribers []EventHandler
 	ctx         context.Context
 	mu          sync.RWMutex
@@ -47,10 +46,16 @@ func NewEventRouter() *EventRouter {
 	}
 }
 
-func (r *EventRouter) SetRiverClient(client *river.Client) {
+func (r *EventRouter) SetRiverClient(client *river.Client[*sql.Tx]) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.riverClient = client
+}
+
+func (r *EventRouter) RiverClient() *river.Client[*sql.Tx] {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.riverClient
 }
 
 func (r *EventRouter) Subscribe(handler EventHandler) {

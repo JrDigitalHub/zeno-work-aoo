@@ -109,8 +109,17 @@ func NewRelationalStore(connectionString string) (*RelationalStore, error) {
 	);
 	DO $$
 	BEGIN
+		-- Drop the old constraint if it exists and only covers 2 columns (workspace_id, reference_id)
+		IF EXISTS (
+			SELECT 1 FROM pg_constraint 
+			WHERE conname = 'unique_workspace_reference' 
+			AND array_length(conkey, 1) = 2
+		) THEN
+			ALTER TABLE journal_entries DROP CONSTRAINT unique_workspace_reference;
+		END IF;
+
 		IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'unique_workspace_reference') THEN
-			ALTER TABLE journal_entries ADD CONSTRAINT unique_workspace_reference UNIQUE (workspace_id, reference_id);
+			ALTER TABLE journal_entries ADD CONSTRAINT unique_workspace_reference UNIQUE (workspace_id, reference_id, entry_type);
 		END IF;
 	END;
 	$$;

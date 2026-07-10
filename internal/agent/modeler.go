@@ -2,7 +2,7 @@ package agent
 
 import (
 	"context"
-	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,6 +17,7 @@ import (
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/memory"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/orchestrator"
 	"github.com/JrDigitalHub/zeno-work-aoo/pkg/protocol"
+	"github.com/lib/pq"
 	"github.com/riverqueue/river"
 )
 
@@ -198,46 +199,65 @@ func (f *FinancialModeler) HandleIngestInvoice(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Generate a unique cryptographically safe job ID
-	jobBytes := make([]byte, 16)
-	_, _ = rand.Read(jobBytes)
-	jobID := hex.EncodeToString(jobBytes)
+	// Derive JobID deterministically: hash of workspaceID + bodyBytes + upload timestamp rounded to a 5-minute window
+	timeWindow := time.Now().UTC().Truncate(5 * time.Minute).Format(time.RFC3339)
+	hasher := sha256.New()
+	hasher.Write([]byte(workspaceID))
+	hasher.Write([]byte(":"))
+	hasher.Write(bodyBytes)
+	hasher.Write([]byte(":"))
+	hasher.Write([]byte(timeWindow))
+	jobID := hex.EncodeToString(hasher.Sum(nil))
+
+	var isDuplicate bool
 
 	// Write PENDING state to database
 	if err := f.DB.CreateBackgroundJob(r.Context(), jobID, workspaceID); err != nil {
-		slog.Error("Failed to create background job", slog.String("job_id", jobID), slog.Any("error", err))
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Failed to initialize background job: %v", err)})
-		return
-	}
-
-	// Launch background River job or fallback if DB/River is offline
-	rc := f.router.RiverClient()
-	if rc == nil {
-		slog.Warn("DB/River offline, running invoice processing in raw goroutine", slog.String("job_id", jobID))
-		go func() {
-			_ = f.processInvoiceAsync(context.Background(), jobID, workspaceID, bodyBytes)
-		}()
-	} else {
-		_, err = rc.Insert(r.Context(), orchestrator.ProcessInvoiceJobArgs{
-			JobID:       jobID,
-			WorkspaceID: workspaceID,
-			Payload:     bodyBytes,
-		}, nil)
-		if err != nil {
-			slog.Error("Failed to insert ProcessInvoice job, falling back to raw goroutine", slog.String("job_id", jobID), slog.Any("error", err))
-			go func() {
-				_ = f.processInvoiceAsync(context.Background(), jobID, workspaceID, bodyBytes)
-			}()
+		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
+			isDuplicate = true
+		} else {
+			slog.Error("Failed to create background job", slog.String("job_id", jobID), slog.Any("error", err))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Failed to initialize background job: %v", err)})
+			return
 		}
 	}
 
-	// Instantly return 202 Accepted status with job_id
+	if !isDuplicate {
+		// Launch background River job or fallback if DB/River is offline
+		rc := f.router.RiverClient()
+		if rc == nil {
+			slog.Warn("DB/River offline, running invoice processing in raw goroutine", slog.String("job_id", jobID))
+			go func() {
+				_ = f.processInvoiceAsync(context.Background(), jobID, workspaceID, bodyBytes)
+			}()
+		} else {
+			insertRes, err := rc.Insert(r.Context(), orchestrator.ProcessInvoiceJobArgs{
+				JobID:       jobID,
+				WorkspaceID: workspaceID,
+				Payload:     bodyBytes,
+			}, nil)
+			if err != nil {
+				slog.Error("Failed to insert ProcessInvoice job, falling back to raw goroutine", slog.String("job_id", jobID), slog.Any("error", err))
+				go func() {
+					_ = f.processInvoiceAsync(context.Background(), jobID, workspaceID, bodyBytes)
+				}()
+			} else if insertRes.UniqueSkippedAsDuplicate {
+				isDuplicate = true
+			}
+		}
+	}
+
+	// Instantly return 202 Accepted status with job_id, distinguishing new job from duplicate
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
+	status := "queued"
+	if isDuplicate {
+		status = "duplicate"
+	}
 	json.NewEncoder(w).Encode(map[string]string{
-		"status": "queued",
+		"status": status,
 		"job_id": jobID,
 	})
 }

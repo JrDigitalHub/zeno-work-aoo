@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -80,9 +81,16 @@ func (s *Sentinel) React(ctx context.Context, e protocol.Event) error {
 		}
 
 		// 3. Reserve pipeline slot
-		s.backOffice.RegisterPipeline(ctx, e.WorkspaceID, e.ID)
+		if err := s.backOffice.RegisterPipeline(ctx, e.WorkspaceID, e.ID); err != nil {
+			fmt.Printf("❌ [SENTINEL] Failed to register pipeline: %v\n", err)
+			return err
+		}
 
-		defer s.backOffice.ReleasePipeline(ctx, e.WorkspaceID, e.ID)
+		defer func() {
+			if err := s.backOffice.ReleasePipeline(ctx, e.WorkspaceID, e.ID); err != nil {
+				fmt.Printf("⚠️ [SENTINEL] Failed to release pipeline: %v\n", err)
+			}
+		}()
 
 		fmt.Printf("\n⚙️ [SENTINEL] Processing New Context! Workspace: [%s] Target ID: %s\n", e.WorkspaceID, e.ID)
 
@@ -100,14 +108,18 @@ func (s *Sentinel) React(ctx context.Context, e protocol.Event) error {
 		}
 
 		// 5. Anchoring semantic truth in Qdrant
-		metadata := map[string]any{
-			"workspace_id": e.WorkspaceID,
-			"url":          e.ID,
-			"timestamp":    e.Timestamp,
-		}
-		err = s.vectorStore.UpsertVector(e.ID, vector, metadata)
-		if err != nil {
-			fmt.Printf("⚠️ [SENTINEL] Vector upsert failure: %v\n", err)
+		if s.vectorStore == nil {
+			fmt.Println("⚠️ [SENTINEL] Vector Memory offline. Bypassing semantic upsert.")
+		} else {
+			metadata := map[string]any{
+				"workspace_id": e.WorkspaceID,
+				"url":          e.ID,
+				"timestamp":    e.Timestamp,
+			}
+			err = s.vectorStore.UpsertVector(e.ID, vector, metadata)
+			if err != nil {
+				fmt.Printf("⚠️ [SENTINEL] Vector upsert failure: %v\n", err)
+			}
 		}
 
 		// 6. Strategic reasoning loop
