@@ -37,8 +37,8 @@ func NewRelationalStore(connectionString string) (*RelationalStore, error) {
 	}
 
 	// ENTERPRISE UPGRADE: Connection Pool Limits
-	db.SetMaxOpenConns(25)                 // Max simultaneous connections
-	db.SetMaxIdleConns(25)                 // Keep connections warm in memory
+	db.SetMaxOpenConns(8)                  // Limit to 8 open connections to stay under Supabase limits
+	db.SetMaxIdleConns(8)                  // Limit to 8 idle connections
 	db.SetConnMaxLifetime(5 * time.Minute) // Safely recycle stale connections
 
 	// Verify the connection is actually alive
@@ -90,6 +90,10 @@ func NewRelationalStore(connectionString string) (*RelationalStore, error) {
 		result TEXT,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
+	ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_background_jobs_idempotency_key 
+		ON background_jobs (idempotency_key) 
+		WHERE idempotency_key IS NOT NULL;
 	`
 	_, err = db.Exec(jobsSchema)
 	if err != nil {

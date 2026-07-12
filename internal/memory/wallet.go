@@ -125,7 +125,7 @@ func (r *RelationalStore) UpgradeWorkspaceTier(ctx context.Context, workspaceID 
 				INSERT INTO journal_entries (workspace_id, account_id, entry_type, amount, description, reference_id)
 				VALUES ($1, $2, $3, $4, $5, $6)
 			`
-			_, err := tx.ExecContext(ctx, insertJournal, workspaceID, "REVENUE", "CREDIT", float64(tokensToAdd), "Workspace Subscription Upgrade to "+newTier, referenceID)
+			_, err := tx.ExecContext(ctx, insertJournal, workspaceID, "SME_REVENUE", "CREDIT", float64(tokensToAdd), "Workspace Subscription Upgrade to "+newTier, referenceID)
 			if err != nil {
 				if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" && pgErr.Constraint == "unique_workspace_reference" {
 					slog.Info("duplicate webhook replay, no-op", slog.String("workspace_id", workspaceID), slog.String("reference_id", referenceID))

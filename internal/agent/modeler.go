@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/memory"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/orchestrator"
 	"github.com/JrDigitalHub/zeno-work-aoo/pkg/protocol"
+	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"github.com/riverqueue/river"
 )
@@ -199,7 +201,7 @@ func (f *FinancialModeler) HandleIngestInvoice(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Derive JobID deterministically: hash of workspaceID + bodyBytes + upload timestamp rounded to a 5-minute window
+	// Derive idempotencyKey deterministically: hash of workspaceID + bodyBytes + upload timestamp rounded to a 5-minute window
 	timeWindow := time.Now().UTC().Truncate(5 * time.Minute).Format(time.RFC3339)
 	hasher := sha256.New()
 	hasher.Write([]byte(workspaceID))
@@ -207,16 +209,68 @@ func (f *FinancialModeler) HandleIngestInvoice(w http.ResponseWriter, r *http.Re
 	hasher.Write(bodyBytes)
 	hasher.Write([]byte(":"))
 	hasher.Write([]byte(timeWindow))
-	jobID := hex.EncodeToString(hasher.Sum(nil))
+	idempotencyKey := hex.EncodeToString(hasher.Sum(nil))
 
+	var jobUUID string
 	var isDuplicate bool
+	var useFallbackGoroutine bool
 
-	// Write PENDING state to database
-	if err := f.DB.CreateBackgroundJob(r.Context(), jobID, workspaceID); err != nil {
-		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
+	// Wrap DB registration and River queue insertion in a single transaction
+	err = f.DB.ExecuteTransaction(r.Context(), func(tx *sql.Tx) error {
+		// 1. Check if a job with this idempotency key already exists
+		existingID, err := f.DB.GetJobByIdempotencyKeyTx(r.Context(), tx, idempotencyKey)
+		if err == nil && existingID != "" {
+			jobUUID = existingID
 			isDuplicate = true
+			return nil
+		}
+
+		jobUUID = uuid.NewString()
+
+		// 2. Write PENDING state to database inside transaction
+		if err := f.DB.CreateBackgroundJobTx(r.Context(), tx, jobUUID, idempotencyKey, workspaceID); err != nil {
+			return err
+		}
+
+		// 3. Launch background River job inside transaction
+		rc := f.router.RiverClient()
+		if rc != nil {
+			insertRes, err := rc.InsertTx(r.Context(), tx, orchestrator.ProcessInvoiceJobArgs{
+				JobID:       jobUUID,
+				WorkspaceID: workspaceID,
+				Payload:     bodyBytes,
+			}, nil)
+			if err != nil {
+				return fmt.Errorf("failed to insert ProcessInvoice job in tx: %w", err)
+			}
+			if insertRes.UniqueSkippedAsDuplicate {
+				isDuplicate = true
+			}
 		} else {
-			slog.Error("Failed to create background job", slog.String("job_id", jobID), slog.Any("error", err))
+			slog.Warn("DB/River offline in tx, setting raw goroutine fallback flag", slog.String("job_id", jobUUID))
+			useFallbackGoroutine = true
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		// Handle unique index race condition
+		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code == "23505" {
+			refetchedID, err2 := f.DB.GetJobByIdempotencyKey(r.Context(), idempotencyKey)
+			if err2 == nil && refetchedID != "" {
+				jobUUID = refetchedID
+				isDuplicate = true
+				useFallbackGoroutine = false
+			} else {
+				slog.Error("Failed to re-fetch job UUID after transaction unique violation", slog.Any("error", err2))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Failed to resolve duplicate job status"})
+				return
+			}
+		} else {
+			slog.Error("Failed to initialize background job transaction", slog.String("idempotency_key", idempotencyKey), slog.Any("error", err))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Failed to initialize background job: %v", err)})
@@ -224,29 +278,10 @@ func (f *FinancialModeler) HandleIngestInvoice(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	if !isDuplicate {
-		// Launch background River job or fallback if DB/River is offline
-		rc := f.router.RiverClient()
-		if rc == nil {
-			slog.Warn("DB/River offline, running invoice processing in raw goroutine", slog.String("job_id", jobID))
-			go func() {
-				_ = f.processInvoiceAsync(context.Background(), jobID, workspaceID, bodyBytes)
-			}()
-		} else {
-			insertRes, err := rc.Insert(r.Context(), orchestrator.ProcessInvoiceJobArgs{
-				JobID:       jobID,
-				WorkspaceID: workspaceID,
-				Payload:     bodyBytes,
-			}, nil)
-			if err != nil {
-				slog.Error("Failed to insert ProcessInvoice job, falling back to raw goroutine", slog.String("job_id", jobID), slog.Any("error", err))
-				go func() {
-					_ = f.processInvoiceAsync(context.Background(), jobID, workspaceID, bodyBytes)
-				}()
-			} else if insertRes.UniqueSkippedAsDuplicate {
-				isDuplicate = true
-			}
-		}
+	if !isDuplicate && useFallbackGoroutine {
+		go func() {
+			_ = f.processInvoiceAsync(context.Background(), jobUUID, workspaceID, bodyBytes)
+		}()
 	}
 
 	// Instantly return 202 Accepted status with job_id, distinguishing new job from duplicate
@@ -258,7 +293,7 @@ func (f *FinancialModeler) HandleIngestInvoice(w http.ResponseWriter, r *http.Re
 	}
 	json.NewEncoder(w).Encode(map[string]string{
 		"status": status,
-		"job_id": jobID,
+		"job_id": jobUUID,
 	})
 }
 
@@ -288,7 +323,7 @@ func (f *FinancialModeler) processInvoiceAsync(ctx context.Context, jobID string
 	resultBytes, _ := json.Marshal(resultData)
 
 	// Record a double entry to log the outcome of the job
-	err := f.DB.LogDoubleEntry(ctx, workspaceID, "EXPENSE", "CASH", 1500.0, "AI OCR Ingested: Zeno Cloud Services", jobID)
+	err := f.DB.LogDoubleEntry(ctx, workspaceID, "COMPUTE_EXPENSE", "OPERATING_CASH", 1500.0, "AI OCR Ingested: Zeno Cloud Services", jobID)
 	if err != nil {
 		slog.Error("Failed to record double entry for invoice", slog.String("job_id", jobID), slog.Any("error", err))
 		return err

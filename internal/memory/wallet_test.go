@@ -21,9 +21,9 @@ func TestRelationalStore_ProvisionNewWorkspace(t *testing.T) {
 		}
 		return nil
 	}
-	_ = func(ctx context.Context, jobID string, workspaceID string) error {
+	_ = func(ctx context.Context, id string, idempotencyKey string, workspaceID string) error {
 		if store != nil {
-			return store.CreateBackgroundJob(ctx, jobID, workspaceID)
+			return store.CreateBackgroundJob(ctx, id, idempotencyKey, workspaceID)
 		}
 		return nil
 	}
