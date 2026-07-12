@@ -265,6 +265,10 @@ func (r *RelationalStore) GetFinancialLedger(ctx context.Context, workspaceID st
 		entries = append(entries, e)
 	}
 
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating ledger rows: %v", err)
+	}
+
 	if entries == nil {
 		entries = []LedgerEntry{}
 	}

@@ -151,6 +151,11 @@ func (m *PipelineManager) HandleGetTasks(w http.ResponseWriter, r *http.Request)
 		tasks = append(tasks, t)
 	}
 
+	if err := rows.Err(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "error iterating task rows: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+
 	// Ensure we return an empty array [] instead of null if there are no tasks
 	if tasks == nil {
 		tasks = []Task{}
