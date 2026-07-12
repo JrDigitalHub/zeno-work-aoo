@@ -1,33 +1,45 @@
 package memory
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
 )
 
 // CreateBackgroundJob registers a new job with PENDING status in the database.
-func (r *RelationalStore) CreateBackgroundJob(jobID string, workspaceID string) error {
+func (r *RelationalStore) CreateBackgroundJob(ctx context.Context, id string, idempotencyKey string, workspaceID string) error {
 	query := `
-		INSERT INTO background_jobs (id, workspace_id, status, result, created_at)
-		VALUES ($1, $2, 'PENDING', NULL, $3)
+		INSERT INTO background_jobs (id, idempotency_key, workspace_id, status, result, created_at)
+		VALUES ($1, $2, $3, 'PENDING', NULL, $4)
 	`
-	_, err := r.DB.Exec(query, jobID, workspaceID, time.Now())
+	_, err := r.DB.ExecContext(ctx, query, id, idempotencyKey, workspaceID, time.Now())
 	if err != nil {
 		return fmt.Errorf("failed to create background job: %v", err)
 	}
 	return nil
 }
 
+// GetJobByIdempotencyKey retrieves the job's UUID by its idempotency key.
+func (r *RelationalStore) GetJobByIdempotencyKey(ctx context.Context, idempotencyKey string) (string, error) {
+	var id string
+	query := `SELECT id FROM background_jobs WHERE idempotency_key = $1`
+	err := r.DB.QueryRowContext(ctx, query, idempotencyKey).Scan(&id)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
 // UpdateJobStatus updates the status and result payload of a background job.
-func (r *RelationalStore) UpdateJobStatus(jobID string, status string, result string) error {
+func (r *RelationalStore) UpdateJobStatus(ctx context.Context, jobID string, status string, result string) error {
 	var err error
 	if result == "" {
 		query := `UPDATE background_jobs SET status = $1 WHERE id = $2`
-		_, err = r.DB.Exec(query, status, jobID)
+		_, err = r.DB.ExecContext(ctx, query, status, jobID)
 	} else {
 		query := `UPDATE background_jobs SET status = $1, result = $2 WHERE id = $3`
-		_, err = r.DB.Exec(query, status, result, jobID)
+		_, err = r.DB.ExecContext(ctx, query, status, result, jobID)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to update job status: %v", err)
@@ -36,11 +48,11 @@ func (r *RelationalStore) UpdateJobStatus(jobID string, status string, result st
 }
 
 // GetJobStatus retrieves the current status and result of a background job.
-func (r *RelationalStore) GetJobStatus(jobID string) (string, string, error) {
+func (r *RelationalStore) GetJobStatus(ctx context.Context, jobID string) (string, string, error) {
 	var status string
 	var result sql.NullString
 	query := `SELECT status, result FROM background_jobs WHERE id = $1`
-	err := r.DB.QueryRow(query, jobID).Scan(&status, &result)
+	err := r.DB.QueryRowContext(ctx, query, jobID).Scan(&status, &result)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return "", "", fmt.Errorf("job not found")
@@ -53,4 +65,28 @@ func (r *RelationalStore) GetJobStatus(jobID string) (string, string, error) {
 		resultStr = result.String
 	}
 	return status, resultStr, nil
+}
+
+// CreateBackgroundJobTx registers a new job with PENDING status inside a database transaction.
+func (r *RelationalStore) CreateBackgroundJobTx(ctx context.Context, tx *sql.Tx, id string, idempotencyKey string, workspaceID string) error {
+	query := `
+		INSERT INTO background_jobs (id, idempotency_key, workspace_id, status, result, created_at)
+		VALUES ($1, $2, $3, 'PENDING', NULL, $4)
+	`
+	_, err := tx.ExecContext(ctx, query, id, idempotencyKey, workspaceID, time.Now())
+	if err != nil {
+		return fmt.Errorf("failed to create background job in tx: %w", err)
+	}
+	return nil
+}
+
+// GetJobByIdempotencyKeyTx retrieves the job's UUID by its idempotency key inside a database transaction.
+func (r *RelationalStore) GetJobByIdempotencyKeyTx(ctx context.Context, tx *sql.Tx, idempotencyKey string) (string, error) {
+	var id string
+	query := `SELECT id FROM background_jobs WHERE idempotency_key = $1`
+	err := tx.QueryRowContext(ctx, query, idempotencyKey).Scan(&id)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
 }

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -65,49 +66,60 @@ type GeminiEmbeddingResponse struct {
 	} `json:"embedding"`
 }
 
-func (s *Sentinel) React(e protocol.Event) {
+func (s *Sentinel) React(ctx context.Context, e protocol.Event) error {
 	if e.Source == "PREDATOR" {
 		// 1. Relational sanity check using Neo4j
 		if _, exists := s.graphStore.Recall(e.ID); exists {
 			fmt.Printf("🛡️ [SENTINEL] Graph memory confirms target [%s] was already processed. Aborting duplicate operation.\n", e.ID)
-			return
+			return nil
 		}
 
 		// 2. Back-Office Capacity Check
-		if !s.backOffice.CheckCapacity(e.WorkspaceID) {
+		if !s.backOffice.CheckCapacity(ctx, e.WorkspaceID) {
 			fmt.Printf("⛔ [SENTINEL] Back-Office rejected workflow for Workspace [%s] Target [%s]: Internal capacity maxed out.\n", e.WorkspaceID, e.ID)
-			return
+			return fmt.Errorf("back-office rejected workflow: capacity maxed out")
 		}
 
 		// 3. Reserve pipeline slot
-		s.backOffice.RegisterPipeline(e.WorkspaceID, e.ID)
+		if err := s.backOffice.RegisterPipeline(ctx, e.WorkspaceID, e.ID); err != nil {
+			fmt.Printf("❌ [SENTINEL] Failed to register pipeline: %v\n", err)
+			return err
+		}
 
-		defer s.backOffice.ReleasePipeline(e.WorkspaceID, e.ID)
+		defer func() {
+			if err := s.backOffice.ReleasePipeline(ctx, e.WorkspaceID, e.ID); err != nil {
+				fmt.Printf("⚠️ [SENTINEL] Failed to release pipeline: %v\n", err)
+			}
+		}()
 
 		fmt.Printf("\n⚙️ [SENTINEL] Processing New Context! Workspace: [%s] Target ID: %s\n", e.WorkspaceID, e.ID)
 
 		if s.apiKey == "" {
 			fmt.Println("❌ [SENTINEL] Critical configuration failure: GEMINI_API_KEY environment variable is empty.")
-			return
+			return fmt.Errorf("GEMINI_API_KEY env is empty")
 		}
 
 		// 4. Cloud Embedding Generation
 		fmt.Println("⚙️ [SENTINEL] Generating high-dimensional vector embeddings...")
-		vector, err := s.getEmbedding(e.Payload)
+		vector, err := s.getEmbedding(ctx, e.Payload)
 		if err != nil {
 			fmt.Printf("❌ [SENTINEL] Embedding generation failed: %v\n", err)
-			return
+			return err
 		}
 
 		// 5. Anchoring semantic truth in Qdrant
-		metadata := map[string]any{
-			"workspace_id": e.WorkspaceID,
-			"url":          e.ID,
-			"timestamp":    e.Timestamp,
-		}
-		err = s.vectorStore.UpsertVector(e.ID, vector, metadata)
-		if err != nil {
-			fmt.Printf("⚠️ [SENTINEL] Vector upsert failure: %v\n", err)
+		if s.vectorStore == nil {
+			fmt.Println("⚠️ [SENTINEL] Vector Memory offline. Bypassing semantic upsert.")
+		} else {
+			metadata := map[string]any{
+				"workspace_id": e.WorkspaceID,
+				"url":          e.ID,
+				"timestamp":    e.Timestamp,
+			}
+			err = s.vectorStore.UpsertVector(e.ID, vector, metadata)
+			if err != nil {
+				fmt.Printf("⚠️ [SENTINEL] Vector upsert failure: %v\n", err)
+			}
 		}
 
 		// 6. Strategic reasoning loop
@@ -135,17 +147,24 @@ func (s *Sentinel) React(e protocol.Event) {
 		})
 
 		url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=%s", s.apiKey)
-		resp, err := http.Post(url, "application/json", bytes.NewBuffer(reqBody))
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(reqBody))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
 		if err != nil {
 			fmt.Printf("❌ [SENTINEL] Neural Core connection error: %v\n", err)
-			return
+			return err
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
 			fmt.Printf("❌ [SENTINEL] Neural Core error %d: %s\n", resp.StatusCode, string(body))
-			return
+			return fmt.Errorf("neural core error: status %d", resp.StatusCode)
 		}
 
 		body, _ := io.ReadAll(resp.Body)
@@ -157,7 +176,7 @@ func (s *Sentinel) React(e protocol.Event) {
 			responseText = geminiResp.Candidates[0].Content.Parts[0].Text
 		} else {
 			fmt.Println("❌ [SENTINEL] Neural Core returned empty matrix response.")
-			return
+			return fmt.Errorf("neural core returned empty response")
 		}
 
 		fmt.Printf("\n✅ [SENTINEL] Intelligence Generated for [%s]:\n\n%s\n\n", e.WorkspaceID, responseText)
@@ -170,17 +189,21 @@ func (s *Sentinel) React(e protocol.Event) {
 		})
 
 		// 8. Broadcast to Zoho EmailEngine via SENTINEL_TEXT_OUTPUT
-		s.router.Publish(protocol.Event{
+		err = s.router.Publish(ctx, protocol.Event{
 			WorkspaceID: e.WorkspaceID,
 			ID:          e.ID, // The email recipient
 			Source:      "SENTINEL_TEXT_OUTPUT",
 			Payload:     responseText,
 			Timestamp:   time.Now().Unix(),
 		})
+		if err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func (s *Sentinel) getEmbedding(text string) ([]float32, error) {
+func (s *Sentinel) getEmbedding(ctx context.Context, text string) ([]float32, error) {
 	embReq, _ := json.Marshal(GeminiEmbeddingRequest{
 		Content: GeminiContent{
 			Parts: []GeminiPart{{Text: text}},
@@ -189,7 +212,14 @@ func (s *Sentinel) getEmbedding(text string) ([]float32, error) {
 	})
 
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=%s", s.apiKey)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(embReq))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(embReq))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

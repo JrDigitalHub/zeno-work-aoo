@@ -1,6 +1,7 @@
 package backoffice
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -47,7 +48,7 @@ func NewPipelineManager(db *sql.DB) *PipelineManager {
 // =====================================================================
 
 // ProvisionWorkspace sets up the initial load capacity for a tenant
-func (m *PipelineManager) ProvisionWorkspace(workspaceID string) {
+func (m *PipelineManager) ProvisionWorkspace(ctx context.Context, workspaceID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, exists := m.activePipelines[workspaceID]; !exists {
@@ -57,7 +58,7 @@ func (m *PipelineManager) ProvisionWorkspace(workspaceID string) {
 }
 
 // ReservePipeline increments the active job count for a tenant
-func (m *PipelineManager) ReservePipeline(workspaceID, targetID string) {
+func (m *PipelineManager) ReservePipeline(ctx context.Context, workspaceID, targetID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.activePipelines[workspaceID]++
@@ -65,12 +66,12 @@ func (m *PipelineManager) ReservePipeline(workspaceID, targetID string) {
 }
 
 // ReleasePipeline decrements the active job count and frees the slot
-func (m *PipelineManager) ReleasePipeline(workspaceID, targetID string) {
+func (m *PipelineManager) ReleasePipeline(ctx context.Context, workspaceID, targetID string) error {
     // 1. Update the persistent Task database (The Dashboard State)
-    _, err := m.DB.Exec("UPDATE tasks SET status = $1 WHERE workspace_id = $2 AND context = $3", 
+    _, err := m.DB.ExecContext(ctx, "UPDATE tasks SET status = $1 WHERE workspace_id = $2 AND context = $3", 
         "COMPLETED", workspaceID, targetID)
     if err != nil {
-        log.Printf("⚠️ [COO] Failed to release pipeline: %v", err)
+        return fmt.Errorf("failed to release pipeline: %v", err)
     }
 
     // 2. Update the in-memory load balancer (The Concurrency Manager)
@@ -81,6 +82,7 @@ func (m *PipelineManager) ReleasePipeline(workspaceID, targetID string) {
     }
     
     fmt.Printf("♻️ [BACK-OFFICE] Pipeline slot released for Workspace [%s] Target [%s]. Active Load: %d/10\n", workspaceID, targetID, m.activePipelines[workspaceID])
+    return nil
 }
 
 // =====================================================================
@@ -89,7 +91,7 @@ func (m *PipelineManager) ReleasePipeline(workspaceID, targetID string) {
 
 // CreateTask safely inserts a new operational requirement into the Postgres ledger
 // This is called internally by your Go agents when a human needs to review something.
-func (m *PipelineManager) CreateTask(workspaceID, priority, context string) error {
+func (m *PipelineManager) CreateTask(ctx context.Context, workspaceID, priority, context string) error {
 	if m.DB == nil {
 		return fmt.Errorf("database connection is not initialized in COO service")
 	}
@@ -98,7 +100,7 @@ func (m *PipelineManager) CreateTask(workspaceID, priority, context string) erro
 		INSERT INTO tasks (workspace_id, owner_role, priority, status, context, created_at, updated_at)
 		VALUES ($1, 'COO', $2, 'PENDING', $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 	`
-	_, err := m.DB.Exec(query, workspaceID, priority, context)
+	_, err := m.DB.ExecContext(ctx, query, workspaceID, priority, context)
 	if err != nil {
 		return fmt.Errorf("failed to create COO task: %v", err)
 	}
@@ -127,10 +129,10 @@ func (m *PipelineManager) HandleGetTasks(w http.ResponseWriter, r *http.Request)
 
 	if statusFilter != "" {
 		query := `SELECT task_id, workspace_id, owner_role, priority, status, context, created_at, updated_at FROM tasks WHERE workspace_id = $1 AND status = $2 ORDER BY created_at DESC`
-		rows, err = m.DB.Query(query, workspaceID, strings.ToUpper(statusFilter))
+		rows, err = m.DB.QueryContext(r.Context(), query, workspaceID, strings.ToUpper(statusFilter))
 	} else {
 		query := `SELECT task_id, workspace_id, owner_role, priority, status, context, created_at, updated_at FROM tasks WHERE workspace_id = $1 ORDER BY created_at DESC`
-		rows, err = m.DB.Query(query, workspaceID)
+		rows, err = m.DB.QueryContext(r.Context(), query, workspaceID)
 	}
 
 	if err != nil {
@@ -147,6 +149,11 @@ func (m *PipelineManager) HandleGetTasks(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 		tasks = append(tasks, t)
+	}
+
+	if err := rows.Err(); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "error iterating task rows: %v"}`, err), http.StatusInternalServerError)
+		return
 	}
 
 	// Ensure we return an empty array [] instead of null if there are no tasks
@@ -200,7 +207,7 @@ func (m *PipelineManager) HandleUpdateTask(w http.ResponseWriter, r *http.Reques
 		SET status = $1, updated_at = CURRENT_TIMESTAMP 
 		WHERE task_id = $2 AND workspace_id = $3
 	`
-	res, err := m.DB.Exec(query, newStatus, taskID, workspaceID)
+	res, err := m.DB.ExecContext(r.Context(), query, newStatus, taskID, workspaceID)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error": "Database update failed: %v"}`, err), http.StatusInternalServerError)
 		return
@@ -250,32 +257,33 @@ func (m *PipelineManager) LoadWorkflowRules() (*WorkflowConfig, error) {
 
 // Ingest receives raw data payloads from external sources (webhooks, Shopline, etc.)
 // and automatically routes them into actionable COO tasks on the Kanban board.
-func (m *PipelineManager) Ingest(workspaceID, source, payload string) {
+func (m *PipelineManager) Ingest(ctx context.Context, workspaceID, source, payload string) {
 	log.Printf("📥 [COO] Raw data ingested for Workspace [%s] from Source [%s]", workspaceID, source)
 
 	// Convert this ingestion into an actionable task for the dashboard
 	contextMsg := fmt.Sprintf("Review inbound data from %s. Payload summary: %s", source, payload)
 
 	// Route it to the database as a MEDIUM priority task
-	err := m.CreateTask(workspaceID, "MEDIUM", contextMsg)
+	err := m.CreateTask(ctx, workspaceID, "MEDIUM", contextMsg)
 	if err != nil {
 		log.Printf("⚠️ [COO] Failed to route external ingestion to task list: %v", err)
 	}
 }
-func (m *PipelineManager) CheckCapacity(workspaceID string) bool {
+func (m *PipelineManager) CheckCapacity(ctx context.Context, workspaceID string) bool {
     var count int
-    err := m.DB.QueryRow("SELECT COUNT(*) FROM tasks WHERE workspace_id = $1 AND status = 'PENDING'", workspaceID).Scan(&count)
+    err := m.DB.QueryRowContext(ctx, "SELECT COUNT(*) FROM tasks WHERE workspace_id = $1 AND status = 'PENDING'", workspaceID).Scan(&count)
     if err != nil {
         return false
     }
     return count < 50
 }
 
-func (m *PipelineManager) RegisterPipeline(workspaceID, targetID string) {
-    _, err := m.DB.Exec("INSERT INTO tasks (workspace_id, task_type, status, context) VALUES ($1, $2, $3, $4)", 
-        workspaceID, "SENTINEL_PROCESS", "PROCESSING", targetID)
+func (m *PipelineManager) RegisterPipeline(ctx context.Context, workspaceID, targetID string) error {
+    _, err := m.DB.ExecContext(ctx, "INSERT INTO tasks (workspace_id, owner_role, status, context) VALUES ($1, $2, $3, $4)", 
+        workspaceID, "SENTINEL", "PROCESSING", targetID)
     if err != nil {
-        log.Printf("⚠️ [COO] Failed to register pipeline: %v", err)
+        return fmt.Errorf("failed to register pipeline: %v", err)
     }
+    return nil
 }
 

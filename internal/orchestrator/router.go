@@ -2,28 +2,27 @@ package orchestrator
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
 	"fmt"
-	"log"
-	"net/http"
+	"log/slog"
 	"os"
-	"strings"
+	"sync"
 	"time"
 
+	"github.com/JrDigitalHub/zeno-work-aoo/internal/memory"
 	"github.com/JrDigitalHub/zeno-work-aoo/pkg/protocol"
 	"github.com/redis/go-redis/v9"
+	"github.com/riverqueue/river"
 )
 
-// ==========================================
-// 1. THE INTERNAL NEURAL BUS (REDIS)
-// ==========================================
-
-type EventHandler func(protocol.Event)
+type EventHandler func(ctx context.Context, event protocol.Event) error
 
 type EventRouter struct {
-	client      *redis.Client
+	client      *redis.Client // Keep for cache/session fallback compatibility if needed
+	riverClient *river.Client[*sql.Tx]
 	subscribers []EventHandler
 	ctx         context.Context
+	mu          sync.RWMutex
 }
 
 func NewEventRouter() *EventRouter {
@@ -32,11 +31,12 @@ func NewEventRouter() *EventRouter {
 		redisURL = "localhost:6379" // Default local Docker port
 	}
 
+	// Connect to Redis (used for caching/sessions other than this pub/sub)
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     redisURL,
-		Password: "", 
+		Password: "",
 		DB:       0,
-		PoolSize: 100,
+		PoolSize: 10, // Small connection pool for non-pub/sub cache
 	})
 
 	return &EventRouter{
@@ -46,125 +46,421 @@ func NewEventRouter() *EventRouter {
 	}
 }
 
+func (r *EventRouter) SetRiverClient(client *river.Client[*sql.Tx]) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.riverClient = client
+}
+
+func (r *EventRouter) RiverClient() *river.Client[*sql.Tx] {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.riverClient
+}
+
 func (r *EventRouter) Subscribe(handler EventHandler) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.subscribers = append(r.subscribers, handler)
 }
 
 func (r *EventRouter) Start() {
-	fmt.Println("🛡️ [ROUTER] Redis Protocol Engine online. Awaiting telemetry...")
+	fmt.Println("🛡️ [ROUTER] River Background Job Engine online. Awaiting telemetry...")
+	// Redis Pub/Sub subscription loop is replaced entirely with River worker loops.
+	// We no longer spawn subscribers via redis Pub/Sub inside router.go.
+}
 
-	go func() {
-		pubsub := r.client.Subscribe(r.ctx, "zeno_neural_bus")
-		defer pubsub.Close()
+func (r *EventRouter) Dispatch(ctx context.Context, e protocol.Event) error {
+	r.mu.RLock()
+	subs := make([]EventHandler, len(r.subscribers))
+	copy(subs, r.subscribers)
+	r.mu.RUnlock()
 
-		channel := pubsub.Channel()
-		for msg := range channel {
-			var incomingEvent protocol.Event
-			if err := json.Unmarshal([]byte(msg.Payload), &incomingEvent); err != nil {
-				log.Printf("❌ [ROUTER] Failed to decode telemetry: %v", err)
-				continue
-			}
-			for _, handler := range r.subscribers {
-				go handler(incomingEvent)
-			}
+	var errs []error
+	for _, handler := range subs {
+		if err := r.runHandler(ctx, handler, e); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("dispatch errors: %v", errs)
+	}
+	return nil
+}
+
+func (r *EventRouter) runHandler(ctx context.Context, handler EventHandler, e protocol.Event) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			slog.Error("Recovered from panic in event handler", slog.Any("panic", p), slog.String("source", e.Source))
+			err = fmt.Errorf("panic in handler: %v", p)
 		}
 	}()
+	return handler(ctx, e)
 }
 
-func (r *EventRouter) Publish(e protocol.Event) {
-	payload, err := json.Marshal(e)
-	if err != nil {
-		return
+func (r *EventRouter) Publish(ctx context.Context, e protocol.Event) error {
+	r.mu.RLock()
+	rc := r.riverClient
+	r.mu.RUnlock()
+
+	if rc == nil {
+		env := os.Getenv("APP_ENV")
+		if env == "production" || env == "prod" {
+			return fmt.Errorf("database/River client is offline in production environment; cannot publish event")
+		}
+		slog.Warn("DB/River offline, executing subscribers inline (development fallback)", slog.String("source", e.Source))
+		return r.Dispatch(ctx, e)
 	}
-	r.client.Publish(r.ctx, "zeno_neural_bus", payload)
+
+	var args river.JobArgs
+	switch e.Source {
+	case "DISCOVERY":
+		args = DiscoveryJobArgs{
+			WorkspaceID: e.WorkspaceID,
+			ID:          e.ID,
+			Source:      e.Source,
+			Target:      e.Target,
+			Payload:     e.Payload,
+			Timestamp:   e.Timestamp,
+		}
+	case "PREDATOR":
+		args = PredatorJobArgs{
+			WorkspaceID: e.WorkspaceID,
+			ID:          e.ID,
+			Source:      e.Source,
+			Target:      e.Target,
+			Payload:     e.Payload,
+			Timestamp:   e.Timestamp,
+		}
+	case "SENTINEL_TEXT_OUTPUT":
+		args = SentinelTextOutputJobArgs{
+			WorkspaceID: e.WorkspaceID,
+			ID:          e.ID,
+			Source:      e.Source,
+			Target:      e.Target,
+			Payload:     e.Payload,
+			Timestamp:   e.Timestamp,
+		}
+	case "MODELER_RESULT":
+		args = ModelerResultJobArgs{
+			WorkspaceID: e.WorkspaceID,
+			ID:          e.ID,
+			Source:      e.Source,
+			Target:      e.Target,
+			Payload:     e.Payload,
+			Timestamp:   e.Timestamp,
+		}
+	default:
+		env := os.Getenv("APP_ENV")
+		if env == "production" || env == "prod" {
+			return fmt.Errorf("unregistered event source %s in production environment; cannot publish event", e.Source)
+		}
+		slog.Warn("Unregistered event source, executing inline (development fallback)", slog.String("source", e.Source))
+		return r.Dispatch(ctx, e)
+	}
+
+	_, err := rc.Insert(ctx, args, nil)
+	return err
 }
 
-// ==========================================
-// 2. THE EXTERNAL HTTP API (NEXT.JS FACING)
-// ==========================================
+func (r *EventRouter) PublishTx(ctx context.Context, tx *sql.Tx, e protocol.Event) error {
+	r.mu.RLock()
+	rc := r.riverClient
+	r.mu.RUnlock()
 
-// SetupHTTPRouter creates the REST endpoints that Vercel connects to
-func SetupHTTPRouter(eventBus *EventRouter) *http.ServeMux {
-	mux := http.NewServeMux()
-
-	// 1. Global State: Wallet Hydration
-	mux.HandleFunc("/api/v1/wallet", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
+	if rc == nil {
+		env := os.Getenv("APP_ENV")
+		if env == "production" || env == "prod" {
+			return fmt.Errorf("database/River client is offline in production environment; cannot publish event")
 		}
-		
-		// NOTE: In production, extract WorkspaceID from the JWT context here!
-		
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"token_balance":     10000,
-			"subscription_tier": "Trial",
-			"workspace_id":      "auto-provisioned-uuid-here",
-			"user": map[string]string{
-				"name":     "Zeno Administrator",
-				"email":    "admin@jrdigitalhubltd.com",
-				"initials": "ZA",
-			},
-		})
-	})
+		slog.Warn("DB/River offline, executing subscribers inline (development fallback)", slog.String("source", e.Source))
+		return r.Dispatch(ctx, e)
+	}
 
-	// 2. Oracle: Lead Generation Scan
-	mux.HandleFunc("/api/v1/oracle/scan", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
+	var args river.JobArgs
+	switch e.Source {
+	case "DISCOVERY":
+		args = DiscoveryJobArgs{
+			WorkspaceID: e.WorkspaceID,
+			ID:          e.ID,
+			Source:      e.Source,
+			Target:      e.Target,
+			Payload:     e.Payload,
+			Timestamp:   e.Timestamp,
 		}
-
-		// Example response matching the Oracle frontend UI structure
-		json.NewEncoder(w).Encode([]map[string]interface{}{
-			{
-				"id":      1,
-				"company": "Apex Dynamics",
-				"contact": "Jane Doe",
-				"role":    "VP of Strategy",
-				"domain":  "apexdynamics.io",
-				"status":  "Verified",
-				"score":   94,
-			},
-		})
-	})
-
-	// 3. Sentinel: Operations / Tasks (Formerly COO)
-	mux.HandleFunc("/api/v1/sentinel/tasks", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
+	case "PREDATOR":
+		args = PredatorJobArgs{
+			WorkspaceID: e.WorkspaceID,
+			ID:          e.ID,
+			Source:      e.Source,
+			Target:      e.Target,
+			Payload:     e.Payload,
+			Timestamp:   e.Timestamp,
 		}
-
-		// Returns the Kanban Board structure the frontend expects
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"backlog": []map[string]interface{}{
-				{"id": 1, "title": "Audit Q3 Vendor Contracts", "priority": "High", "assignee": "Sentinel", "createdAt": time.Now().Format("Jan 02")},
-			},
-			"in-progress": []map[string]interface{}{
-				{"id": 2, "title": "Scale Redis Cluster", "priority": "Critical", "assignee": "DevOps", "createdAt": time.Now().Format("Jan 02")},
-			},
-			"completed": []interface{}{},
-		})
-	})
-
-	// 4. Modeler: Financial Ledger (Formerly CFO)
-	mux.HandleFunc("/api/v1/modeler/ledger", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
+	case "SENTINEL_TEXT_OUTPUT":
+		args = SentinelTextOutputJobArgs{
+			WorkspaceID: e.WorkspaceID,
+			ID:          e.ID,
+			Source:      e.Source,
+			Target:      e.Target,
+			Payload:     e.Payload,
+			Timestamp:   e.Timestamp,
 		}
+	case "MODELER_RESULT":
+		args = ModelerResultJobArgs{
+			WorkspaceID: e.WorkspaceID,
+			ID:          e.ID,
+			Source:      e.Source,
+			Target:      e.Target,
+			Payload:     e.Payload,
+			Timestamp:   e.Timestamp,
+		}
+	default:
+		env := os.Getenv("APP_ENV")
+		if env == "production" || env == "prod" {
+			return fmt.Errorf("unregistered event source %s in production environment; cannot publish event in tx", e.Source)
+		}
+		slog.Warn("Unregistered event source in tx, executing inline (development fallback)", slog.String("source", e.Source))
+		return r.Dispatch(ctx, e)
+	}
 
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"balance": 284950.0,
-			"inflow":  128400.0,
-			"outflow": 51200.0,
-			"transactions": []map[string]interface{}{
-				{"id": "TXN-001", "date": "Jul 05, 2026", "description": "Enterprise SaaS License", "category": "Revenue", "amount": 18000, "type": "incoming"},
-				{"id": "TXN-002", "date": "Jul 04, 2026", "description": "AWS Infrastructure", "category": "Ops", "amount": -2400, "type": "outgoing"},
-			},
-		})
-	})
-
-	return mux
+	_, err := rc.InsertTx(ctx, tx, args, nil)
+	return err
 }
+
+// --- Job Args Structs ---
+
+type DiscoveryJobArgs struct {
+	WorkspaceID string `json:"workspace_id"`
+	ID          string `json:"id"`
+	Source      string `json:"source"`
+	Target      string `json:"target"`
+	Payload     string `json:"payload"`
+	Timestamp   int64  `json:"timestamp"`
+}
+
+func (DiscoveryJobArgs) Kind() string { return "discovery" }
+func (DiscoveryJobArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		Queue:       "discovery",
+		MaxAttempts: 5,
+	}
+}
+
+type PredatorJobArgs struct {
+	WorkspaceID string `json:"workspace_id"`
+	ID          string `json:"id"`
+	Source      string `json:"source"`
+	Target      string `json:"target"`
+	Payload     string `json:"payload"`
+	Timestamp   int64  `json:"timestamp"`
+}
+
+func (PredatorJobArgs) Kind() string { return "predator" }
+func (PredatorJobArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		Queue:       "predator",
+		MaxAttempts: 5,
+	}
+}
+
+type SentinelTextOutputJobArgs struct {
+	WorkspaceID string `json:"workspace_id"`
+	ID          string `json:"id"`
+	Source      string `json:"source"`
+	Target      string `json:"target"`
+	Payload     string `json:"payload"`
+	Timestamp   int64  `json:"timestamp"`
+}
+
+func (SentinelTextOutputJobArgs) Kind() string { return "sentinel_text_output" }
+func (SentinelTextOutputJobArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		Queue:       "sentinel",
+		MaxAttempts: 5,
+	}
+}
+
+type ModelerResultJobArgs struct {
+	WorkspaceID string `json:"workspace_id"`
+	ID          string `json:"id"`
+	Source      string `json:"source"`
+	Target      string `json:"target"`
+	Payload     string `json:"payload"`
+	Timestamp   int64  `json:"timestamp"`
+}
+
+func (ModelerResultJobArgs) Kind() string { return "modeler_result" }
+func (ModelerResultJobArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		Queue:       "modeler",
+		MaxAttempts: 5,
+	}
+}
+
+type ProcessInvoiceJobArgs struct {
+	JobID       string `json:"job_id"`
+	WorkspaceID string `json:"workspace_id"`
+	Payload     []byte `json:"payload"`
+}
+
+func (ProcessInvoiceJobArgs) Kind() string { return "process_invoice" }
+func (ProcessInvoiceJobArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		Queue: "modeler",
+		UniqueOpts: river.UniqueOpts{
+			ByArgs: true,
+		},
+		MaxAttempts: 3,
+	}
+}
+
+type UpgradeWorkspaceJobArgs struct {
+	WorkspaceID string `json:"workspace_id"`
+	NewTier     string `json:"new_tier"`
+	TokensToAdd int    `json:"tokens_to_add"`
+	ReferenceID string `json:"reference_id"`
+}
+
+func (UpgradeWorkspaceJobArgs) Kind() string { return "upgrade_workspace" }
+func (UpgradeWorkspaceJobArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		Queue: "wallet",
+		UniqueOpts: river.UniqueOpts{
+			ByArgs: true,
+		},
+		MaxAttempts: 3,
+	}
+}
+
+// --- River Workers ---
+
+type DiscoveryWorker struct {
+	river.WorkerDefaults[DiscoveryJobArgs]
+	Router *EventRouter
+}
+
+func (w *DiscoveryWorker) Work(ctx context.Context, job *river.Job[DiscoveryJobArgs]) (err error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Panic in DiscoveryWorker", slog.Any("panic", r), slog.Int64("job_id", job.ID))
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+
+	event := protocol.Event{
+		WorkspaceID: job.Args.WorkspaceID,
+		ID:          job.Args.ID,
+		Source:      job.Args.Source,
+		Target:      job.Args.Target,
+		Payload:     job.Args.Payload,
+		Timestamp:   job.Args.Timestamp,
+	}
+	return w.Router.Dispatch(ctx, event)
+}
+
+type PredatorWorker struct {
+	river.WorkerDefaults[PredatorJobArgs]
+	Router *EventRouter
+}
+
+func (w *PredatorWorker) Work(ctx context.Context, job *river.Job[PredatorJobArgs]) (err error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Panic in PredatorWorker", slog.Any("panic", r), slog.Int64("job_id", job.ID))
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+
+	event := protocol.Event{
+		WorkspaceID: job.Args.WorkspaceID,
+		ID:          job.Args.ID,
+		Source:      job.Args.Source,
+		Target:      job.Args.Target,
+		Payload:     job.Args.Payload,
+		Timestamp:   job.Args.Timestamp,
+	}
+	return w.Router.Dispatch(ctx, event)
+}
+
+type SentinelTextOutputWorker struct {
+	river.WorkerDefaults[SentinelTextOutputJobArgs]
+	Router *EventRouter
+}
+
+func (w *SentinelTextOutputWorker) Work(ctx context.Context, job *river.Job[SentinelTextOutputJobArgs]) (err error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Panic in SentinelTextOutputWorker", slog.Any("panic", r), slog.Int64("job_id", job.ID))
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+
+	event := protocol.Event{
+		WorkspaceID: job.Args.WorkspaceID,
+		ID:          job.Args.ID,
+		Source:      job.Args.Source,
+		Target:      job.Args.Target,
+		Payload:     job.Args.Payload,
+		Timestamp:   job.Args.Timestamp,
+	}
+	return w.Router.Dispatch(ctx, event)
+}
+
+type ModelerResultWorker struct {
+	river.WorkerDefaults[ModelerResultJobArgs]
+	Router *EventRouter
+}
+
+func (w *ModelerResultWorker) Work(ctx context.Context, job *river.Job[ModelerResultJobArgs]) (err error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Panic in ModelerResultWorker", slog.Any("panic", r), slog.Int64("job_id", job.ID))
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+
+	event := protocol.Event{
+		WorkspaceID: job.Args.WorkspaceID,
+		ID:          job.Args.ID,
+		Source:      job.Args.Source,
+		Target:      job.Args.Target,
+		Payload:     job.Args.Payload,
+		Timestamp:   job.Args.Timestamp,
+	}
+	return w.Router.Dispatch(ctx, event)
+}
+
+type UpgradeWorkspaceWorker struct {
+	river.WorkerDefaults[UpgradeWorkspaceJobArgs]
+	DB *memory.RelationalStore
+}
+
+func (w *UpgradeWorkspaceWorker) Work(ctx context.Context, job *river.Job[UpgradeWorkspaceJobArgs]) (err error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Panic in UpgradeWorkspaceWorker", slog.Any("panic", r), slog.Int64("job_id", job.ID))
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+
+	// Thread workspace ID through context
+	ctx = context.WithValue(ctx, memory.WorkspaceIDKey, job.Args.WorkspaceID)
+
+	return w.DB.UpgradeWorkspaceTier(ctx, job.Args.WorkspaceID, job.Args.NewTier, job.Args.TokensToAdd, job.Args.ReferenceID)
+}

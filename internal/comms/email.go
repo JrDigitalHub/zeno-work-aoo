@@ -1,6 +1,7 @@
 package comms
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net/smtp"
@@ -173,7 +174,7 @@ func (e *EmailEngine) SendOutbound(workspaceID, to, subject, htmlBody string) er
 	return nil
 }
 
-func (e *EmailEngine) React(event interface{}) {
+func (e *EmailEngine) React(ctx context.Context, event interface{}) error {
 	// Inspect incoming broad structural events passing through the hub using a type switch
 	switch ev := event.(type) {
 
@@ -197,7 +198,7 @@ func (e *EmailEngine) React(event interface{}) {
 			}
 			
 			// Recurse to handle it through your existing Outbound logic
-			e.React(payload)
+			return e.React(ctx, payload)
 		}
 
 	case LeadDiscoveredEvent:
@@ -208,7 +209,7 @@ func (e *EmailEngine) React(event interface{}) {
 		if !assessment.IsQualified {
 			fmt.Printf("⚠️ [EmailEngine] Lead %s failed qualification criteria. Score: %d. Reasons: %v. Execution halted.\n",
 				ev.Data.Name, assessment.Score, assessment.Reasons)
-			return
+			return nil
 		}
 
 		fmt.Printf("🎯 [EmailEngine] Lead %s PASSED qualification setup (Score: %d). Awaiting system composition event...\n",
@@ -222,10 +223,10 @@ func (e *EmailEngine) React(event interface{}) {
 		if e.DB != nil && e.DB.DB != nil {
 			var isPaused bool
 			// We execute a single row scan to extract the boolean.
-			err := e.DB.DB.QueryRow("SELECT is_paused FROM workspaces WHERE id = $1", ev.WorkspaceID).Scan(&isPaused)
+			err := e.DB.DB.QueryRowContext(ctx, "SELECT is_paused FROM workspaces WHERE id = $1", ev.WorkspaceID).Scan(&isPaused)
 			if err == nil && isPaused {
 				fmt.Printf("⏸️ [EmailEngine] Workspace [%s] is PAUSED. Retaining draft in system and aborting SMTP dispatch.\n", ev.WorkspaceID)
-				return
+				return nil
 			}
 		}
 
@@ -234,13 +235,14 @@ func (e *EmailEngine) React(event interface{}) {
 		if !assessment.IsQualified {
 			fmt.Printf("🛑 [EmailEngine] Pre-flight security block: Target %s fails safety parameters. Aborting transmission.\n", ev.Target.Email)
 			// Commenting out the return so the MVP can still fire emails for testing, uncomment in strict production
-			// return 
+			// return nil
 		}
 
 		// Direct handshake execution to Zoho SMTP (Now dynamically pulling credentials)
 		err := e.SendOutbound(ev.WorkspaceID, ev.Target.Email, ev.Subject, ev.Body)
 		if err != nil {
 			fmt.Printf("❌ [EmailEngine] Failed to dispatch outbound transmission to %s: %v\n", ev.Target.Email, err)
+			return err
 		} else {
 			fmt.Printf("🚀 [EmailEngine] Success! Outbound message cleanly delivered to %s from Workspace [%s] system node.\n", ev.Target.Email, ev.WorkspaceID)
 		}
@@ -248,4 +250,5 @@ func (e *EmailEngine) React(event interface{}) {
 	default:
 		// Ignore unhandled event structures floating inside the runtime bus
 	}
+	return nil
 }

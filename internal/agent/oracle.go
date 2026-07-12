@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -58,7 +59,7 @@ func (o *Oracle) getOrCreateState(workspaceID string) *WorkspaceState {
 }
 
 // React listens to the network to generate high-level business intelligence
-func (o *Oracle) React(e protocol.Event) {
+func (o *Oracle) React(ctx context.Context, e protocol.Event) error {
 	if e.Source == "SENTINEL_TEXT_OUTPUT" {
 		// Fetch the isolated state for whichever client owns this event
 		state := o.getOrCreateState(e.WorkspaceID)
@@ -78,10 +79,11 @@ func (o *Oracle) React(e protocol.Event) {
 			fmt.Println("⚠️ SYSTEM BOTTLENECK DETECTED: Automated outreach pipeline is currently operating at 100% capacity limit (3/3 active workflows).")
 			fmt.Println("💡 STRATEGIC RECOMMENDATION: Throttling discovery intake. All overflow targets will be cached in the Vector queue until Back-Office capacity clears.")
 			fmt.Println("=======================================================")
-			return
+			return nil
 		}
 
 		// Always unlock if the condition wasn't met
 		state.mu.Unlock()
 	}
+	return nil
 }
