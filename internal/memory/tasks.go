@@ -32,19 +32,23 @@ func (r *RelationalStore) GetJobByIdempotencyKey(ctx context.Context, idempotenc
 }
 
 // UpdateJobStatus updates the status and result payload of a background job.
-func (r *RelationalStore) UpdateJobStatus(ctx context.Context, jobID string, status string, result string) error {
-	var err error
-	if result == "" {
-		query := `UPDATE background_jobs SET status = $1 WHERE id = $2`
-		_, err = r.DB.ExecContext(ctx, query, status, jobID)
-	} else {
-		query := `UPDATE background_jobs SET status = $1, result = $2 WHERE id = $3`
-		_, err = r.DB.ExecContext(ctx, query, status, result, jobID)
-	}
-	if err != nil {
-		return fmt.Errorf("failed to update job status: %v", err)
-	}
-	return nil
+func (r *RelationalStore) UpdateJobStatus(ctx context.Context, workspaceID string, jobID string, status string, result string) error {
+	ctxWithWorkspace := context.WithValue(ctx, WorkspaceIDKey, workspaceID)
+
+	return r.ExecuteTransaction(ctxWithWorkspace, func(tx *sql.Tx) error {
+		var err error
+		if result == "" {
+			query := `UPDATE background_jobs SET status = $1 WHERE id = $2`
+			_, err = tx.ExecContext(ctxWithWorkspace, query, status, jobID)
+		} else {
+			query := `UPDATE background_jobs SET status = $1, result = $2 WHERE id = $3`
+			_, err = tx.ExecContext(ctxWithWorkspace, query, status, result, jobID)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to update job status: %w", err)
+		}
+		return nil
+	})
 }
 
 // GetJobStatus retrieves the current status and result of a background job.

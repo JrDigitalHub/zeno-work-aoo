@@ -37,8 +37,8 @@ func NewRelationalStore(connectionString string) (*RelationalStore, error) {
 	}
 
 	// ENTERPRISE UPGRADE: Connection Pool Limits
-	db.SetMaxOpenConns(8)                  // Limit to 8 open connections to stay under Supabase limits
-	db.SetMaxIdleConns(8)                  // Limit to 8 idle connections
+	db.SetMaxOpenConns(4)                  // Limit to 4 open connections to stay under Supabase limits
+	db.SetMaxIdleConns(4)                  // Limit to 4 idle connections
 	db.SetConnMaxLifetime(5 * time.Minute) // Safely recycle stale connections
 
 	// Verify the connection is actually alive

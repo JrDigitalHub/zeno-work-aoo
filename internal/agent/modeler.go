@@ -303,7 +303,7 @@ func (f *FinancialModeler) processInvoiceAsync(ctx context.Context, jobID string
 	ctx = context.WithValue(ctx, memory.WorkspaceIDKey, workspaceID)
 
 	// 1. Update status to PROCESSING
-	_ = f.DB.UpdateJobStatus(ctx, jobID, "PROCESSING", "")
+	_ = f.DB.UpdateJobStatus(ctx, workspaceID, jobID, "PROCESSING", "")
 
 	// 2. Simulate resource-heavy AI OCR processing (sleep for 3 seconds)
 	select {
@@ -330,7 +330,7 @@ func (f *FinancialModeler) processInvoiceAsync(ctx context.Context, jobID string
 	}
 
 	// 3. Save outcome as COMPLETED
-	err = f.DB.UpdateJobStatus(ctx, jobID, "COMPLETED", string(resultBytes))
+	err = f.DB.UpdateJobStatus(ctx, workspaceID, jobID, "COMPLETED", string(resultBytes))
 	if err != nil {
 		slog.Error("Failed to update background job status to COMPLETED", slog.String("job_id", jobID), slog.Any("error", err))
 		return err

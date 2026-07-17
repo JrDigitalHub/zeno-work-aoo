@@ -27,9 +27,9 @@ func TestRelationalStore_ProvisionNewWorkspace(t *testing.T) {
 		}
 		return nil
 	}
-	_ = func(ctx context.Context, jobID string, status string, result string) error {
+	_ = func(ctx context.Context, workspaceID string, jobID string, status string, result string) error {
 		if store != nil {
-			return store.UpdateJobStatus(ctx, jobID, status, result)
+			return store.UpdateJobStatus(ctx, workspaceID, jobID, status, result)
 		}
 		return nil
 	}
