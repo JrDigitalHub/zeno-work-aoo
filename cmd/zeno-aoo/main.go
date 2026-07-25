@@ -50,14 +50,13 @@ func main() {
 		fmt.Println("⚠️  No .env file found, relying on system environment variables.")
 	}
 
-	
 	// Configure global JSON logger for production readability
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 	slog.SetDefault(logger)
 
-	slog.Info("ZENO OS Boot Sequence Initiated", 
+	slog.Info("ZENO OS Boot Sequence Initiated",
 		slog.String("module", "core_system"),
 		slog.String("status", "booting"),
 	)
@@ -81,7 +80,7 @@ func main() {
 		fmt.Printf("⚠️ WARNING: Graph Memory offline. Bypassing for frontend development: %v\n", err)
 	} else {
 		defer graphBrain.Close()
-	fmt.Println("🧠 [MEMORY] Neural Graph (Neo4j) connected successfully.")
+		fmt.Println("🧠 [MEMORY] Neural Graph (Neo4j) connected successfully.")
 	}
 
 	// 2. Ignite Qdrant (NOW CLOUD READY)
@@ -439,7 +438,7 @@ func main() {
 			return
 		}
 
-		geminiURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=%s", apiKey)
+		geminiURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=%s", apiKey)
 
 		// Set system instruction prompt based on agent type
 		systemPrompt := "You are the Zeno OS Autonomous Operations Officer. Help the user."
