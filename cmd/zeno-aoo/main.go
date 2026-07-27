@@ -192,7 +192,11 @@ func main() {
 		client, err := river.NewClient(driver, &river.Config{
 			Queues: map[string]river.QueueConfig{
 				river.QueueDefault: {MaxWorkers: 1},
-				"modeler":          {MaxWorkers: 1},
+				"modeler":          {MaxWorkers: 5},
+				"discovery":        {MaxWorkers: 10},
+				"predator":         {MaxWorkers: 5},
+				"sentinel":         {MaxWorkers: 10},
+				"wallet":           {MaxWorkers: 5},
 			},
 			Workers: workers,
 		})
