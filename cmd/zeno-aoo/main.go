@@ -27,6 +27,7 @@ import (
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/agent"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/backoffice"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/comms"
+	"github.com/JrDigitalHub/zeno-work-aoo/internal/crypto"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/memory"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/middleware"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/orchestrator"
@@ -534,6 +535,136 @@ func main() {
 			"agent_type":    req.AgentType,
 			"token_balance": newBalance,
 		})
+	}))
+
+	// =========================================================================
+	// 🛡️ WORKSPACE SMTP SETTINGS ROUTES (GET, POST, DELETE)
+	// =========================================================================
+
+	http.HandleFunc("/api/v1/settings/smtp", middleware.EngineSecurityGuard(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		ctxWorkspace := r.Context().Value(middleware.WorkspaceContextKey)
+		if ctxWorkspace == nil {
+			ctxWorkspace = r.Context().Value("workspace_id")
+		}
+		if ctxWorkspace == nil || fmt.Sprintf("%v", ctxWorkspace) == "" {
+			http.Error(w, `{"error": "Unauthorized. Missing workspace context."}`, http.StatusUnauthorized)
+			return
+		}
+		workspaceID := fmt.Sprintf("%v", ctxWorkspace)
+
+		switch r.Method {
+		case http.MethodGet:
+			if relationalBrain == nil {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"configured": false,
+				})
+				return
+			}
+			creds, err := relationalBrain.GetSMTPCredentials(r.Context(), workspaceID)
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"error": "Failed to fetch SMTP settings: %v"}`, err), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if creds == nil {
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"configured": false,
+				})
+				return
+			}
+			// Mask password: NEVER return decrypted or raw password
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"configured":  true,
+				"host":        creds.Host,
+				"port":        creds.Port,
+				"username":    creds.Username,
+				"sender_name": creds.SenderName,
+				"updated_at":  creds.UpdatedAt,
+			})
+
+		case http.MethodPost:
+			var req struct {
+				Host       string `json:"host"`
+				Port       string `json:"port"`
+				Username   string `json:"username"`
+				Password   string `json:"password"`
+				SenderName string `json:"sender_name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, `{"error": "Invalid request body"}`, http.StatusBadRequest)
+				return
+			}
+			if req.Host == "" || req.Port == "" || req.Username == "" || req.Password == "" {
+				http.Error(w, `{"error": "Missing required fields: host, port, username, password"}`, http.StatusBadRequest)
+				return
+			}
+			if req.SenderName == "" {
+				req.SenderName = req.Username
+			}
+
+			// Encrypt password before storing
+			encryptedPass, err := crypto.Encrypt(req.Password)
+			if err != nil {
+				http.Error(w, fmt.Sprintf(`{"error": "Failed to encrypt password: %v"}`, err), http.StatusInternalServerError)
+				return
+			}
+
+			if relationalBrain == nil {
+				http.Error(w, `{"error": "Database store offline"}`, http.StatusInternalServerError)
+				return
+			}
+
+			creds := memory.SMTPCredentials{
+				WorkspaceID: workspaceID,
+				Host:        req.Host,
+				Port:        req.Port,
+				Username:    req.Username,
+				Password:    encryptedPass,
+				SenderName:  req.SenderName,
+			}
+			if err := relationalBrain.SaveSMTPCredentials(r.Context(), creds); err != nil {
+				http.Error(w, fmt.Sprintf(`{"error": "Failed to save SMTP credentials: %v"}`, err), http.StatusInternalServerError)
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"message":     "SMTP credentials saved successfully",
+				"configured":  true,
+				"host":        req.Host,
+				"port":        req.Port,
+				"username":    req.Username,
+				"sender_name": req.SenderName,
+			})
+
+		case http.MethodDelete:
+			if relationalBrain == nil {
+				http.Error(w, `{"error": "Database store offline"}`, http.StatusInternalServerError)
+				return
+			}
+			if err := relationalBrain.DeleteSMTPCredentials(r.Context(), workspaceID); err != nil {
+				http.Error(w, fmt.Sprintf(`{"error": "Failed to delete SMTP credentials: %v"}`, err), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"message":    "SMTP credentials deleted, reverted to system default",
+				"configured": false,
+			})
+
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
 	}))
 
 	// =========================================================================

@@ -274,3 +274,63 @@ func (r *RelationalStore) GetFinancialLedger(ctx context.Context, workspaceID st
 	}
 	return entries, nil
 }
+
+// SMTPCredentials represents workspace-level custom SMTP settings
+type SMTPCredentials struct {
+	ID          string    `json:"id"`
+	WorkspaceID string    `json:"workspace_id"`
+	Host        string    `json:"host"`
+	Port        string    `json:"port"`
+	Username    string    `json:"username"`
+	Password    string    `json:"password"`
+	SenderName  string    `json:"sender_name"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+func (r *RelationalStore) SaveSMTPCredentials(ctx context.Context, creds SMTPCredentials) error {
+	query := `
+		INSERT INTO smtp_credentials (workspace_id, host, port, username, password, sender_name, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, NOW())
+		ON CONFLICT (workspace_id) DO UPDATE SET
+			host = EXCLUDED.host,
+			port = EXCLUDED.port,
+			username = EXCLUDED.username,
+			password = EXCLUDED.password,
+			sender_name = EXCLUDED.sender_name,
+			updated_at = NOW();
+	`
+	_, err := r.DB.ExecContext(ctx, query, creds.WorkspaceID, creds.Host, creds.Port, creds.Username, creds.Password, creds.SenderName)
+	if err != nil {
+		return fmt.Errorf("failed to save smtp credentials: %w", err)
+	}
+	return nil
+}
+
+func (r *RelationalStore) GetSMTPCredentials(ctx context.Context, workspaceID string) (*SMTPCredentials, error) {
+	query := `
+		SELECT id, workspace_id, host, port, username, password, sender_name, updated_at
+		FROM smtp_credentials
+		WHERE workspace_id = $1
+	`
+	row := r.DB.QueryRowContext(ctx, query, workspaceID)
+	var c SMTPCredentials
+	var idStr string
+	if err := row.Scan(&idStr, &c.WorkspaceID, &c.Host, &c.Port, &c.Username, &c.Password, &c.SenderName, &c.UpdatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get smtp credentials: %w", err)
+	}
+	c.ID = idStr
+	return &c, nil
+}
+
+func (r *RelationalStore) DeleteSMTPCredentials(ctx context.Context, workspaceID string) error {
+	query := `DELETE FROM smtp_credentials WHERE workspace_id = $1`
+	_, err := r.DB.ExecContext(ctx, query, workspaceID)
+	if err != nil {
+		return fmt.Errorf("failed to delete smtp credentials: %w", err)
+	}
+	return nil
+}
+

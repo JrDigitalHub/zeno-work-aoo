@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net/smtp"
 	"strings"
 
+	"github.com/JrDigitalHub/zeno-work-aoo/internal/crypto"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/memory"
 	"github.com/JrDigitalHub/zeno-work-aoo/pkg/protocol"
 )
@@ -64,16 +66,17 @@ func NewEmailEngine(server, port, username, password, senderName string, db *mem
 // 👉 Dynamic Enterprise Routing Logic
 // Fetches the specific client's SMTP credentials from Supabase. Falls back to JR Digital Hub system default.
 func (e *EmailEngine) getClientSMTP(workspaceID string) (server, port, user, pass, sender string) {
-	// TODO: Replace with actual Supabase DB query -> e.DB.Query(...) using workspaceID
-	// Example: SELECT smtp_host, smtp_user, smtp_pass FROM client_integrations WHERE workspace_id = ?
-	
-	customSMTPFound := false // Simulating DB check
-	
-	if customSMTPFound {
-		// Return the client's specific credentials
-		return "client.smtp.com", "587", "client@theircompany.com", "client_pass", "Client CEO"
+	if workspaceID != "" && e.DB != nil {
+		creds, err := e.DB.GetSMTPCredentials(context.Background(), workspaceID)
+		if err == nil && creds != nil {
+			decryptedPass, err := crypto.Decrypt(creds.Password)
+			if err == nil {
+				return creds.Host, creds.Port, creds.Username, decryptedPass, creds.SenderName
+			}
+			slog.Warn("⚠️ [EmailEngine] Failed to decrypt custom SMTP password, falling back to default", "workspace_id", workspaceID, "error", err)
+		}
 	}
-	
+
 	// Fallback to the Master System Account provided during initialization
 	return e.SMTPServer, e.SMTPPort, e.Username, e.Password, e.SenderName
 }
