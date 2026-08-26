@@ -28,6 +28,7 @@ import (
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/memory"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/middleware"
 	"github.com/JrDigitalHub/zeno-work-aoo/internal/orchestrator"
+	"github.com/JrDigitalHub/zeno-work-aoo/pkg/models"
 	"github.com/JrDigitalHub/zeno-work-aoo/pkg/protocol"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverdatabasesql"
@@ -916,6 +917,192 @@ func main() {
 		})
 	})
 
+	// =========================================================================
+	// 🛡️ ENTERPRISE BILLING & CHECKOUT ROUTES (PAYSTACK INITIALIZATION)
+	// =========================================================================
+
+	// POST /api/v1/billing/checkout - Initializes a Paystack transaction for subscription upgrade
+	http.HandleFunc("/api/v1/billing/checkout", middleware.EngineSecurityGuard(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+			return
+		}
+
+		ctxWorkspace := r.Context().Value(middleware.WorkspaceContextKey)
+		if ctxWorkspace == nil {
+			ctxWorkspace = r.Context().Value("workspace_id")
+		}
+		if ctxWorkspace == nil || fmt.Sprintf("%v", ctxWorkspace) == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized. Missing workspace context."})
+			return
+		}
+		workspaceID := fmt.Sprintf("%v", ctxWorkspace)
+
+		// Parse request payload
+		var req struct {
+			Tier        string `json:"tier"`
+			Plan        string `json:"plan"`
+			Email       string `json:"email"`
+			CallbackURL string `json:"callback_url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request payload"})
+			return
+		}
+
+		// Support 'tier' or 'plan' field interchangeably
+		planName := strings.TrimSpace(req.Tier)
+		if planName == "" {
+			planName = strings.TrimSpace(req.Plan)
+		}
+
+		planDetails, ok := models.ResolvePlan(planName)
+		if !ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": fmt.Sprintf("Invalid plan requested: %q. Valid options are %s or %s.", planName, models.TierStarter, models.TierProfessional),
+			})
+			return
+		}
+
+		// Resolve user email: prioritize request body, fallback to workspace database record
+		userEmail := strings.TrimSpace(req.Email)
+		if userEmail == "" && relationalBrain != nil {
+			var dbEmail sql.NullString
+			err := relationalBrain.DB.QueryRowContext(r.Context(), "SELECT email FROM workspaces WHERE id = $1", workspaceID).Scan(&dbEmail)
+			if err == nil && dbEmail.Valid && strings.TrimSpace(dbEmail.String) != "" {
+				userEmail = strings.TrimSpace(dbEmail.String)
+			}
+		}
+
+		if userEmail == "" {
+			userEmail = fmt.Sprintf("workspace-%s@zeno.os", workspaceID)
+		}
+
+		secret := os.Getenv("PAYSTACK_SECRET_KEY")
+		if secret == "" {
+			slog.Error("PAYSTACK_SECRET_KEY is not configured", slog.String("workspace_id", workspaceID))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Payment processor not configured on server"})
+			return
+		}
+
+		// Paystack initialize payload
+		type PaystackInitMetadata struct {
+			WorkspaceID string `json:"workspace_id"`
+			Tier        string `json:"tier"`
+			Tokens      int    `json:"tokens"`
+		}
+
+		type PaystackInitReq struct {
+			Email       string               `json:"email"`
+			Amount      int                  `json:"amount"` // in kobo
+			Metadata    PaystackInitMetadata `json:"metadata"`
+			CallbackURL string               `json:"callback_url,omitempty"`
+		}
+
+		initReqPayload := PaystackInitReq{
+			Email:  userEmail,
+			Amount: planDetails.AmountKobo,
+			Metadata: PaystackInitMetadata{
+				WorkspaceID: workspaceID,
+				Tier:        planDetails.Tier,
+				Tokens:      planDetails.Tokens,
+			},
+			CallbackURL: req.CallbackURL,
+		}
+
+		reqBodyBytes, err := json.Marshal(initReqPayload)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to serialize payment request"})
+			return
+		}
+
+		httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, "https://api.paystack.co/transaction/initialize", bytes.NewBuffer(reqBodyBytes))
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to build transaction request"})
+			return
+		}
+
+		httpReq.Header.Set("Authorization", "Bearer "+secret)
+		httpReq.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{Timeout: 15 * time.Second}
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			slog.Error("Failed to reach Paystack transaction/initialize API", slog.Any("error", err), slog.String("workspace_id", workspaceID))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to communicate with payment gateway"})
+			return
+		}
+		defer resp.Body.Close()
+
+		respBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read gateway response"})
+			return
+		}
+
+		type PaystackInitData struct {
+			AuthorizationURL string `json:"authorization_url"`
+			AccessCode       string `json:"access_code"`
+			Reference        string `json:"reference"`
+		}
+
+		type PaystackInitResp struct {
+			Status  bool             `json:"status"`
+			Message string           `json:"message"`
+			Data    PaystackInitData `json:"data"`
+		}
+
+		var paystackResp PaystackInitResp
+		if err := json.Unmarshal(respBytes, &paystackResp); err != nil || !paystackResp.Status {
+			slog.Error("Paystack initialization rejected", slog.Int("status_code", resp.StatusCode), slog.String("response", string(respBytes)), slog.String("workspace_id", workspaceID))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			if paystackResp.Message != "" {
+				json.NewEncoder(w).Encode(map[string]string{"error": paystackResp.Message})
+			} else {
+				json.NewEncoder(w).Encode(map[string]string{"error": "Payment initialization failed"})
+			}
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":            "success",
+			"authorization_url": paystackResp.Data.AuthorizationURL,
+			"access_code":       paystackResp.Data.AccessCode,
+			"reference":         paystackResp.Data.Reference,
+			"data":              paystackResp.Data,
+		})
+	}))
+
 	// 👉 Paystack Webhook (Unauthenticated, protected by x-paystack-signature header verification)
 	http.HandleFunc("/api/v1/webhooks/paystack", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1004,24 +1191,18 @@ func main() {
 			return
 		}
 
-		// Determine new tier and tokens to add based on the amount paid (in kobo)
-		var newTier string
-		var tokensToAdd int
-
-		switch amount {
-		case 1499900: // Starter Plan: ₦14,999 -> 500,000 tokens
-			newTier = "Starter"
-			tokensToAdd = 500000
-		case 9999900: // Pro Plan: ₦99,999 -> 2,000,000 tokens
-			newTier = "Professional"
-			tokensToAdd = 2000000
-		default:
+		// Determine new tier and tokens to add based on the canonical plan amount (in kobo)
+		planDetails, ok := models.ResolvePlanByAmount(amount)
+		if !ok {
 			slog.Warn("Received charge.success with unexpected amount", slog.Int("amount", amount), slog.String("workspace_id", workspaceID))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Unexpected payment amount: %d", amount)})
 			return
 		}
+
+		newTier := planDetails.Tier
+		tokensToAdd := planDetails.Tokens
 
 		if riverClient != nil {
 			_, err = riverClient.Insert(r.Context(), orchestrator.UpgradeWorkspaceJobArgs{
