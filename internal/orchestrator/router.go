@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -316,10 +317,13 @@ func (ProcessInvoiceJobArgs) InsertOpts() river.InsertOpts {
 }
 
 type UpgradeWorkspaceJobArgs struct {
-	WorkspaceID string `json:"workspace_id"`
-	NewTier     string `json:"new_tier"`
-	TokensToAdd int    `json:"tokens_to_add"`
-	ReferenceID string `json:"reference_id"`
+	WorkspaceID string  `json:"workspace_id"`
+	NewTier     string  `json:"new_tier"`
+	TokensToAdd int     `json:"tokens_to_add"`
+	ReferenceID string  `json:"reference_id"`
+	Gateway     string  `json:"gateway,omitempty"`
+	Amount      float64 `json:"amount,omitempty"`
+	Currency    string  `json:"currency,omitempty"`
 }
 
 func (UpgradeWorkspaceJobArgs) Kind() string { return "upgrade_workspace" }
@@ -462,5 +466,18 @@ func (w *UpgradeWorkspaceWorker) Work(ctx context.Context, job *river.Job[Upgrad
 	// Thread workspace ID through context
 	ctx = context.WithValue(ctx, memory.WorkspaceIDKey, job.Args.WorkspaceID)
 
-	return w.DB.UpgradeWorkspaceTier(ctx, job.Args.WorkspaceID, job.Args.NewTier, job.Args.TokensToAdd, job.Args.ReferenceID)
+	gateway := job.Args.Gateway
+	if gateway == "" {
+		gateway = "flutterwave"
+		if strings.HasPrefix(job.Args.ReferenceID, "pstk_") || strings.HasPrefix(job.Args.ReferenceID, "pstk-") {
+			gateway = "paystack"
+		}
+	}
+	currency := job.Args.Currency
+	if currency == "" {
+		currency = "USD"
+	}
+
+	_, err = w.DB.ProcessBillingUpgrade(ctx, gateway, job.Args.ReferenceID, job.Args.WorkspaceID, job.Args.Amount, currency, job.Args.NewTier, job.Args.TokensToAdd)
+	return err
 }

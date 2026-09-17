@@ -1404,6 +1404,7 @@ func main() {
 		}
 		type PaystackData struct {
 			Amount    int              `json:"amount"`
+			Currency  string           `json:"currency"`
 			Reference string           `json:"reference"`
 			Metadata  PaystackMetadata `json:"metadata"`
 		}
@@ -1454,11 +1455,18 @@ func main() {
 		tokensToAdd := planDetails.Tokens
 
 		if riverClient != nil {
+			currency := event.Data.Currency
+			if currency == "" {
+				currency = "NGN"
+			}
 			_, err = riverClient.Insert(r.Context(), orchestrator.UpgradeWorkspaceJobArgs{
 				WorkspaceID: workspaceID,
 				NewTier:     newTier,
 				TokensToAdd: tokensToAdd,
 				ReferenceID: reference,
+				Gateway:     "paystack",
+				Amount:      float64(amount) / 100.0,
+				Currency:    currency,
 			}, nil)
 			if err != nil {
 				slog.Error("Failed to enqueue UpgradeWorkspaceJob in River via Paystack", slog.String("workspace_id", workspaceID), slog.Any("error", err))
@@ -1470,12 +1478,20 @@ func main() {
 		} else if relationalBrain != nil {
 			slog.Warn("River client is offline, falling back to synchronous execution")
 			ctx := context.WithValue(r.Context(), memory.WorkspaceIDKey, workspaceID)
-			if err := relationalBrain.UpgradeWorkspaceTier(ctx, workspaceID, newTier, tokensToAdd, reference); err != nil {
+			currency := event.Data.Currency
+			if currency == "" {
+				currency = "NGN"
+			}
+			alreadyProcessed, err := relationalBrain.ProcessBillingUpgrade(ctx, "paystack", reference, workspaceID, float64(amount)/100.0, currency, newTier, tokensToAdd)
+			if err != nil {
 				slog.Error("Failed to upgrade workspace tier synchronously", slog.String("workspace_id", workspaceID), slog.String("tier", newTier), slog.Any("error", err))
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
 				json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Upgrade failed: %v", err)})
 				return
+			}
+			if alreadyProcessed {
+				slog.Info("Paystack transaction already processed, returning acknowledged", slog.String("workspace_id", workspaceID), slog.String("reference", reference))
 			}
 		} else {
 			slog.Warn("Relational DB is offline, skipping actual upgrade", slog.String("workspace_id", workspaceID))
@@ -1702,10 +1718,10 @@ func main() {
 			txRef = verifiedData.Data.TxRef
 		}
 
-		// Idempotency check: check if txRef has already been recorded in journal_entries
+		// Idempotency check: check if txRef has already been recorded in processed_billing_transactions
 		if relationalBrain != nil {
 			var exists bool
-			err := relationalBrain.DB.QueryRowContext(r.Context(), "SELECT EXISTS(SELECT 1 FROM journal_entries WHERE reference_id = $1)", txRef).Scan(&exists)
+			err := relationalBrain.DB.QueryRowContext(r.Context(), "SELECT EXISTS(SELECT 1 FROM processed_billing_transactions WHERE gateway = 'flutterwave' AND reference_id = $1)", txRef).Scan(&exists)
 			if err == nil && exists {
 				slog.Info("Duplicate Flutterwave transaction already processed, acknowledging without duplicate credit", slog.String("workspace_id", workspaceID), slog.String("tx_ref", txRef))
 				w.Header().Set("Content-Type", "application/json")
@@ -1725,6 +1741,9 @@ func main() {
 				NewTier:     newTier,
 				TokensToAdd: tokensToAdd,
 				ReferenceID: txRef,
+				Gateway:     "flutterwave",
+				Amount:      verifiedData.Data.Amount,
+				Currency:    verifiedData.Data.Currency,
 			}, nil)
 			if err != nil {
 				slog.Error("Failed to enqueue UpgradeWorkspaceJob in River via Flutterwave", slog.String("workspace_id", workspaceID), slog.Any("error", err))
@@ -1736,12 +1755,16 @@ func main() {
 		} else if relationalBrain != nil {
 			slog.Warn("River client is offline, falling back to synchronous execution")
 			ctx := context.WithValue(r.Context(), memory.WorkspaceIDKey, workspaceID)
-			if err := relationalBrain.UpgradeWorkspaceTier(ctx, workspaceID, newTier, tokensToAdd, txRef); err != nil {
+			alreadyProcessed, err := relationalBrain.ProcessBillingUpgrade(ctx, "flutterwave", txRef, workspaceID, verifiedData.Data.Amount, verifiedData.Data.Currency, newTier, tokensToAdd)
+			if err != nil {
 				slog.Error("Failed to upgrade workspace tier synchronously via Flutterwave", slog.String("workspace_id", workspaceID), slog.String("tier", newTier), slog.Any("error", err))
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
 				json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Upgrade failed: %v", err)})
 				return
+			}
+			if alreadyProcessed {
+				slog.Info("Flutterwave transaction already processed, returning acknowledged", slog.String("workspace_id", workspaceID), slog.String("tx_ref", txRef))
 			}
 		} else {
 			slog.Warn("Relational DB is offline, skipping actual upgrade", slog.String("workspace_id", workspaceID))

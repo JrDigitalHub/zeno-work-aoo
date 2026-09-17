@@ -127,7 +127,18 @@ func NewRelationalStore(connectionString string) (*RelationalStore, error) {
 		END IF;
 	END;
 	$$;
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_journal_entries_reference_id ON journal_entries (reference_id) WHERE reference_id IS NOT NULL;
+	DROP INDEX IF EXISTS idx_journal_entries_reference_id;
+
+	CREATE TABLE IF NOT EXISTS processed_billing_transactions (
+		gateway VARCHAR(50) NOT NULL,
+		reference_id VARCHAR(255) NOT NULL,
+		workspace_id UUID NOT NULL,
+		amount NUMERIC NOT NULL,
+		currency VARCHAR(10) NOT NULL,
+		processed_at TIMESTAMPTZ DEFAULT NOW(),
+		CONSTRAINT pk_billing_idempotency PRIMARY KEY (gateway, reference_id),
+		CONSTRAINT check_reference_not_empty CHECK (reference_id <> '')
+	);
 	`
 	_, err = db.Exec(journalSchema)
 	if err != nil {

@@ -21,6 +21,12 @@ func TestRelationalStore_ProvisionNewWorkspace(t *testing.T) {
 		}
 		return nil
 	}
+	_ = func(ctx context.Context, gateway string, ref string, wsID string, amount float64, currency string, tier string, tokens int) (bool, error) {
+		if store != nil {
+			return store.ProcessBillingUpgrade(ctx, gateway, ref, wsID, amount, currency, tier, tokens)
+		}
+		return false, nil
+	}
 	_ = func(ctx context.Context, id string, idempotencyKey string, workspaceID string) error {
 		if store != nil {
 			return store.CreateBackgroundJob(ctx, id, idempotencyKey, workspaceID)
