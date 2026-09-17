@@ -22,7 +22,11 @@ import (
 
 type contextKey string
 
-const WorkspaceContextKey contextKey = "workspace_id"
+const (
+	WorkspaceContextKey contextKey = "workspace_id"
+	ClaimsContextKey    contextKey = "jwt_claims"
+	RoleContextKey      contextKey = "user_role"
+)
 
 // =========================================================================
 // 1. IP-BASED RATE LIMITER (Multi-Tenant Safe)
@@ -251,9 +255,65 @@ func EngineSecurityGuard(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
+		// Extract role from claims if present
+		userRole := ""
+		if r, ok := claims["role"].(string); ok {
+			userRole = r
+		}
+		if appMeta, ok := claims["app_metadata"].(map[string]interface{}); ok {
+			if r, ok := appMeta["role"].(string); ok && r != "" {
+				userRole = r
+			}
+		}
+		if userMeta, ok := claims["user_metadata"].(map[string]interface{}); ok {
+			if r, ok := userMeta["role"].(string); ok && r != "" {
+				userRole = r
+			}
+		}
+
 		// Inject verified User/Workspace ID down into the request execution pipeline
 		ctx := context.WithValue(r.Context(), WorkspaceContextKey, userID)
 		ctx = context.WithValue(ctx, "workspace_id", userID)
+		ctx = context.WithValue(ctx, ClaimsContextKey, claims)
+		ctx = context.WithValue(ctx, RoleContextKey, userRole)
+		ctx = context.WithValue(ctx, "role", userRole)
 		next(w, r.WithContext(ctx))
 	}
+}
+
+// AdminGuard enforces that the caller has an admin or service_role claim.
+func AdminGuard(next http.HandlerFunc) http.HandlerFunc {
+	return EngineSecurityGuard(func(w http.ResponseWriter, r *http.Request) {
+		roleVal := r.Context().Value(RoleContextKey)
+		if roleVal == nil {
+			roleVal = r.Context().Value("role")
+		}
+		roleStr := fmt.Sprintf("%v", roleVal)
+
+		isAdmin := strings.EqualFold(roleStr, "admin") || strings.EqualFold(roleStr, "service_role") || strings.EqualFold(roleStr, "superadmin")
+		if !isAdmin {
+			if claims, ok := r.Context().Value(ClaimsContextKey).(jwt.MapClaims); ok {
+				if r, ok := claims["role"].(string); ok && (strings.EqualFold(r, "admin") || strings.EqualFold(r, "service_role") || strings.EqualFold(r, "superadmin")) {
+					isAdmin = true
+				} else if appMeta, ok := claims["app_metadata"].(map[string]interface{}); ok {
+					if r, ok := appMeta["role"].(string); ok && (strings.EqualFold(r, "admin") || strings.EqualFold(r, "service_role") || strings.EqualFold(r, "superadmin")) {
+						isAdmin = true
+					}
+				} else if userMeta, ok := claims["user_metadata"].(map[string]interface{}); ok {
+					if r, ok := userMeta["role"].(string); ok && (strings.EqualFold(r, "admin") || strings.EqualFold(r, "service_role") || strings.EqualFold(r, "superadmin")) {
+						isAdmin = true
+					}
+				}
+			}
+		}
+
+		if !isAdmin {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(`{"error": {"code": "FORBIDDEN", "message": "Admin privileges required."}}`))
+			return
+		}
+
+		next(w, r)
+	})
 }

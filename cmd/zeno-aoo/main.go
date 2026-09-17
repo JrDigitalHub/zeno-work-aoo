@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha512"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -34,6 +35,16 @@ import (
 	"github.com/riverqueue/river/riverdriver/riverdatabasesql"
 	"github.com/riverqueue/river/rivermigrate"
 )
+
+// 👉 High-Throughput Billing HTTP Client Singleton (Connection Pooling)
+var billingHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 25,
+		IdleConnTimeout:     90 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+	},
+}
 
 // 👉 Global Master Kill Switch State
 var (
@@ -673,10 +684,25 @@ func main() {
 	http.HandleFunc("/api/v1/system/toggle", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Secret-Key")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		adminSecret := os.Getenv("ADMIN_SECRET_KEY")
+		receivedSecret := r.Header.Get("X-Admin-Secret-Key")
+		if adminSecret == "" || receivedSecret == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(receivedSecret), []byte(adminSecret)) != 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
 			return
 		}
 
@@ -703,13 +729,25 @@ func main() {
 	})
 
 	// 👉 Client Workspace Campaign Toggle (Pause/Resume Client-Specific Pipeline)
-	http.HandleFunc("/api/v1/workspace/toggle", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/v1/workspace/toggle", middleware.EngineSecurityGuard(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		ctxWorkspace := r.Context().Value(middleware.WorkspaceContextKey)
+		if ctxWorkspace == nil {
+			ctxWorkspace = r.Context().Value("workspace_id")
+		}
+		authedWorkspace := fmt.Sprintf("%v", ctxWorkspace)
+		if authedWorkspace == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized. Missing workspace context."})
 			return
 		}
 
@@ -717,10 +755,19 @@ func main() {
 			WorkspaceID string `json:"workspace_id"`
 			IsPaused    bool   `json:"is_paused"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.WorkspaceID == "" {
-			http.Error(w, "Invalid payload. 'workspace_id' and 'is_paused' status required.", http.StatusBadRequest)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid payload. 'is_paused' status required.", http.StatusBadRequest)
 			return
 		}
+
+		// Enforce workspace tenancy
+		if req.WorkspaceID != "" && req.WorkspaceID != authedWorkspace {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Forbidden. Tenancy violation: workspace mismatch."})
+			return
+		}
+		workspaceID := authedWorkspace
 
 		if relationalBrain == nil {
 			http.Error(w, "Relational Store storage subsystem offline.", http.StatusServiceUnavailable)
@@ -728,7 +775,7 @@ func main() {
 		}
 
 		// Update the specific workspace status dynamically inside Supabase Postgres
-		_, err := relationalBrain.DB.Exec("UPDATE workspaces SET is_paused = $1 WHERE id = $2", req.IsPaused, req.WorkspaceID)
+		_, err := relationalBrain.DB.ExecContext(r.Context(), "UPDATE workspaces SET is_paused = $1 WHERE id = $2", req.IsPaused, workspaceID)
 		if err != nil {
 			fmt.Printf("❌ [SYSTEM] Database workspace toggle crash: %v\n", err)
 			http.Error(w, "Database runtime transaction failed.", http.StatusInternalServerError)
@@ -739,17 +786,17 @@ func main() {
 		if req.IsPaused {
 			stateMsg = "PAUSED"
 		}
-		fmt.Printf("⏸️  [SYSTEM] Workspace [%s] campaign status updated to: %s\n", req.WorkspaceID, stateMsg)
+		fmt.Printf("⏸️  [SYSTEM] Workspace [%s] campaign status updated to: %s\n", workspaceID, stateMsg)
 
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "Acknowledged", "workspace_state": stateMsg, "workspace_id": req.WorkspaceID})
-	})
+		json.NewEncoder(w).Encode(map[string]string{"status": "Acknowledged", "workspace_state": stateMsg, "workspace_id": workspaceID})
+	}))
 
 	// 👉 The CEO Directive API Endpoint (Multi-Tenant + Protected)
-	http.HandleFunc("/api/directive", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/directive", middleware.AdminGuard(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
@@ -788,16 +835,35 @@ func main() {
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "Directive Engaged", "workspace_id": req.WorkspaceID, "mode": req.Mode})
-	})
+	}))
 
 	// 👉 Back-Office Ingestion Webhook (The Invisible COO's Ear)
 	http.HandleFunc("/api/v1/ingest", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Webhook-Secret")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Security Check
+		secret := os.Getenv("INGEST_WEBHOOK_SECRET")
+		if secret == "" {
+			secret = os.Getenv("WEBHOOK_SECRET")
+		}
+		receivedSecret := r.Header.Get("X-Webhook-Secret")
+		if secret == "" || receivedSecret == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(receivedSecret), []byte(secret)) != 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
 			return
 		}
 
@@ -955,6 +1021,7 @@ func main() {
 		var req struct {
 			Tier        string `json:"tier"`
 			Plan        string `json:"plan"`
+			Currency    string `json:"currency"`
 			Email       string `json:"email"`
 			CallbackURL string `json:"callback_url"`
 		}
@@ -981,13 +1048,19 @@ func main() {
 			return
 		}
 
-		// Resolve user email: prioritize request body, fallback to workspace database record
+		// Resolve user email and workspace name: prioritize request body, fallback to workspace database record
 		userEmail := strings.TrimSpace(req.Email)
-		if userEmail == "" && relationalBrain != nil {
-			var dbEmail sql.NullString
-			err := relationalBrain.DB.QueryRowContext(r.Context(), "SELECT email FROM workspaces WHERE id = $1", workspaceID).Scan(&dbEmail)
-			if err == nil && dbEmail.Valid && strings.TrimSpace(dbEmail.String) != "" {
-				userEmail = strings.TrimSpace(dbEmail.String)
+		workspaceName := "Workspace " + workspaceID
+		if relationalBrain != nil {
+			var dbEmail, dbName sql.NullString
+			err := relationalBrain.DB.QueryRowContext(r.Context(), "SELECT email, name FROM workspaces WHERE id = $1", workspaceID).Scan(&dbEmail, &dbName)
+			if err == nil {
+				if userEmail == "" && dbEmail.Valid && strings.TrimSpace(dbEmail.String) != "" {
+					userEmail = strings.TrimSpace(dbEmail.String)
+				}
+				if dbName.Valid && strings.TrimSpace(dbName.String) != "" {
+					workspaceName = strings.TrimSpace(dbName.String)
+				}
 			}
 		}
 
@@ -995,41 +1068,203 @@ func main() {
 			userEmail = fmt.Sprintf("workspace-%s@zeno.os", workspaceID)
 		}
 
-		secret := os.Getenv("PAYSTACK_SECRET_KEY")
-		if secret == "" {
-			slog.Error("PAYSTACK_SECRET_KEY is not configured", slog.String("workspace_id", workspaceID))
+		gateway := models.GetActivePaymentGateway()
+		if gateway == models.GatewayPaystack {
+			secret := os.Getenv("PAYSTACK_SECRET_KEY")
+			if secret == "" {
+				slog.Error("PAYSTACK_SECRET_KEY is not configured", slog.String("workspace_id", workspaceID))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Payment processor not configured on server"})
+				return
+			}
+
+			// Paystack initialize payload
+			type PaystackInitMetadata struct {
+				WorkspaceID string `json:"workspace_id"`
+				Tier        string `json:"tier"`
+				Tokens      int    `json:"tokens"`
+			}
+
+			type PaystackInitReq struct {
+				Email       string               `json:"email"`
+				Amount      int                  `json:"amount"` // in kobo
+				Metadata    PaystackInitMetadata `json:"metadata"`
+				CallbackURL string               `json:"callback_url,omitempty"`
+			}
+
+			initReqPayload := PaystackInitReq{
+				Email:  userEmail,
+				Amount: planDetails.AmountKobo,
+				Metadata: PaystackInitMetadata{
+					WorkspaceID: workspaceID,
+					Tier:        planDetails.Tier,
+					Tokens:      planDetails.Tokens,
+				},
+				CallbackURL: req.CallbackURL,
+			}
+
+			reqBodyBytes, err := json.Marshal(initReqPayload)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Failed to serialize payment request"})
+				return
+			}
+
+			paystackCtx, paystackCancel := context.WithTimeout(r.Context(), 10*time.Second)
+			defer paystackCancel()
+
+			httpReq, err := http.NewRequestWithContext(paystackCtx, http.MethodPost, "https://api.paystack.co/transaction/initialize", bytes.NewBuffer(reqBodyBytes))
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Failed to build transaction request"})
+				return
+			}
+
+			httpReq.Header.Set("Authorization", "Bearer "+secret)
+			httpReq.Header.Set("Content-Type", "application/json")
+
+			resp, err := billingHTTPClient.Do(httpReq)
+			if err != nil {
+				slog.Error("Failed to reach Paystack transaction/initialize API", slog.Any("error", err), slog.String("workspace_id", workspaceID))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadGateway)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Failed to communicate with payment gateway"})
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				io.Copy(io.Discard, resp.Body)
+				slog.Error("Paystack initialization returned non-200", slog.Int("status_code", resp.StatusCode), slog.String("workspace_id", workspaceID))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Payment initialization failed"})
+				return
+			}
+
+			respBytes, err := io.ReadAll(resp.Body)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read gateway response"})
+				return
+			}
+
+			type PaystackInitData struct {
+				AuthorizationURL string `json:"authorization_url"`
+				AccessCode       string `json:"access_code"`
+				Reference        string `json:"reference"`
+			}
+
+			type PaystackInitResp struct {
+				Status  bool             `json:"status"`
+				Message string           `json:"message"`
+				Data    PaystackInitData `json:"data"`
+			}
+
+			var paystackResp PaystackInitResp
+			if err := json.Unmarshal(respBytes, &paystackResp); err != nil || !paystackResp.Status {
+				slog.Error("Paystack initialization rejected", slog.Int("status_code", resp.StatusCode), slog.String("response", string(respBytes)), slog.String("workspace_id", workspaceID))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				if paystackResp.Message != "" {
+					json.NewEncoder(w).Encode(map[string]string{"error": paystackResp.Message})
+				} else {
+					json.NewEncoder(w).Encode(map[string]string{"error": "Payment initialization failed"})
+				}
+				return
+			}
+
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Payment processor not configured on server"})
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status":            "success",
+				"authorization_url": paystackResp.Data.AuthorizationURL,
+				"access_code":       paystackResp.Data.AccessCode,
+				"reference":         paystackResp.Data.Reference,
+				"data":              paystackResp.Data,
+			})
 			return
 		}
 
-		// Paystack initialize payload
-		type PaystackInitMetadata struct {
-			WorkspaceID string `json:"workspace_id"`
-			Tier        string `json:"tier"`
-			Tokens      int    `json:"tokens"`
+		// FLUTTERWAVE INITIALIZATION FLOW (DEFAULT ACTIVE GATEWAY)
+		flwConfig := models.GetFlutterwaveConfig()
+		if flwConfig.SecretKey == "" {
+			slog.Error("FLW_SECRET_KEY is not configured", slog.String("workspace_id", workspaceID))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Flutterwave payment processor not configured on server"})
+			return
 		}
 
-		type PaystackInitReq struct {
-			Email       string               `json:"email"`
-			Amount      int                  `json:"amount"` // in kobo
-			Metadata    PaystackInitMetadata `json:"metadata"`
-			CallbackURL string               `json:"callback_url,omitempty"`
+		txRef := fmt.Sprintf("zeno_%s_%d", workspaceID, time.Now().UnixNano())
+
+		redirectURL := req.CallbackURL
+		if redirectURL == "" {
+			frontendURL := os.Getenv("FRONTEND_URL")
+			if frontendURL == "" {
+				frontendURL = "https://app.zeno.work"
+			}
+			redirectURL = fmt.Sprintf("%s/dashboard/billing?verify=true", strings.TrimRight(frontendURL, "/"))
 		}
 
-		initReqPayload := PaystackInitReq{
-			Email:  userEmail,
-			Amount: planDetails.AmountKobo,
-			Metadata: PaystackInitMetadata{
-				WorkspaceID: workspaceID,
-				Tier:        planDetails.Tier,
-				Tokens:      planDetails.Tokens,
+		type FlwPaymentCustomer struct {
+			Email string `json:"email"`
+			Name  string `json:"name"`
+		}
+
+		type FlwPaymentCustomizations struct {
+			Title       string `json:"title"`
+			Description string `json:"description"`
+		}
+
+		type FlwPaymentInitReq struct {
+			TxRef          string                   `json:"tx_ref"`
+			Amount         string                   `json:"amount"`
+			Currency       string                   `json:"currency"`
+			RedirectURL    string                   `json:"redirect_url"`
+			Meta           map[string]string        `json:"meta"`
+			Customer       FlwPaymentCustomer       `json:"customer"`
+			Customizations FlwPaymentCustomizations `json:"customizations"`
+		}
+
+		checkoutCurrency := strings.ToUpper(strings.TrimSpace(req.Currency))
+		if checkoutCurrency == "" {
+			checkoutCurrency = models.CurrencyUSD // Default to USD for international checkouts
+		}
+		if checkoutCurrency != models.CurrencyNGN && checkoutCurrency != models.CurrencyUSD {
+			checkoutCurrency = models.CurrencyUSD
+		}
+
+		var chargeAmount string
+		if checkoutCurrency == models.CurrencyUSD {
+			chargeAmount = fmt.Sprintf("%.2f", planDetails.AmountUSD)
+		} else {
+			chargeAmount = fmt.Sprintf("%.2f", planDetails.AmountMajor())
+		}
+
+		flwReqPayload := FlwPaymentInitReq{
+			TxRef:       txRef,
+			Amount:      chargeAmount,
+			Currency:    checkoutCurrency,
+			RedirectURL: redirectURL,
+			Meta: map[string]string{
+				"workspace_id": workspaceID,
 			},
-			CallbackURL: req.CallbackURL,
+			Customer: FlwPaymentCustomer{
+				Email: userEmail,
+				Name:  workspaceName,
+			},
+			Customizations: FlwPaymentCustomizations{
+				Title:       "Zeno OS",
+				Description: fmt.Sprintf("%s Subscription", planDetails.Tier),
+			},
 		}
 
-		reqBodyBytes, err := json.Marshal(initReqPayload)
+		reqBodyBytes, err := json.Marshal(flwReqPayload)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1037,7 +1272,10 @@ func main() {
 			return
 		}
 
-		httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, "https://api.paystack.co/transaction/initialize", bytes.NewBuffer(reqBodyBytes))
+		flwCtx, flwCancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer flwCancel()
+
+		httpReq, err := http.NewRequestWithContext(flwCtx, http.MethodPost, flwConfig.BaseURL+"/payments", bytes.NewBuffer(reqBodyBytes))
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
@@ -1045,19 +1283,27 @@ func main() {
 			return
 		}
 
-		httpReq.Header.Set("Authorization", "Bearer "+secret)
+		httpReq.Header.Set("Authorization", "Bearer "+flwConfig.SecretKey)
 		httpReq.Header.Set("Content-Type", "application/json")
 
-		client := &http.Client{Timeout: 15 * time.Second}
-		resp, err := client.Do(httpReq)
+		resp, err := billingHTTPClient.Do(httpReq)
 		if err != nil {
-			slog.Error("Failed to reach Paystack transaction/initialize API", slog.Any("error", err), slog.String("workspace_id", workspaceID))
+			slog.Error("Failed to reach Flutterwave payments API", slog.Any("error", err), slog.String("workspace_id", workspaceID))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to communicate with payment gateway"})
 			return
 		}
 		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			io.Copy(io.Discard, resp.Body)
+			slog.Error("Flutterwave payments API returned non-200", slog.Int("status_code", resp.StatusCode), slog.String("workspace_id", workspaceID))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Payment initialization failed at gateway"})
+			return
+		}
 
 		respBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
@@ -1067,25 +1313,23 @@ func main() {
 			return
 		}
 
-		type PaystackInitData struct {
-			AuthorizationURL string `json:"authorization_url"`
-			AccessCode       string `json:"access_code"`
-			Reference        string `json:"reference"`
+		type FlwInitRespData struct {
+			Link string `json:"link"`
 		}
 
-		type PaystackInitResp struct {
-			Status  bool             `json:"status"`
-			Message string           `json:"message"`
-			Data    PaystackInitData `json:"data"`
+		type FlwInitResp struct {
+			Status  string          `json:"status"`
+			Message string          `json:"message"`
+			Data    FlwInitRespData `json:"data"`
 		}
 
-		var paystackResp PaystackInitResp
-		if err := json.Unmarshal(respBytes, &paystackResp); err != nil || !paystackResp.Status {
-			slog.Error("Paystack initialization rejected", slog.Int("status_code", resp.StatusCode), slog.String("response", string(respBytes)), slog.String("workspace_id", workspaceID))
+		var flwResp FlwInitResp
+		if err := json.Unmarshal(respBytes, &flwResp); err != nil || strings.ToLower(flwResp.Status) != "success" || flwResp.Data.Link == "" {
+			slog.Error("Flutterwave initialization rejected", slog.Int("status_code", resp.StatusCode), slog.String("response", string(respBytes)), slog.String("workspace_id", workspaceID))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			if paystackResp.Message != "" {
-				json.NewEncoder(w).Encode(map[string]string{"error": paystackResp.Message})
+			if flwResp.Message != "" {
+				json.NewEncoder(w).Encode(map[string]string{"error": flwResp.Message})
 			} else {
 				json.NewEncoder(w).Encode(map[string]string{"error": "Payment initialization failed"})
 			}
@@ -1096,10 +1340,15 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":            "success",
-			"authorization_url": paystackResp.Data.AuthorizationURL,
-			"access_code":       paystackResp.Data.AccessCode,
-			"reference":         paystackResp.Data.Reference,
-			"data":              paystackResp.Data,
+			"authorization_url": flwResp.Data.Link,
+			"checkout_url":      flwResp.Data.Link,
+			"reference":         txRef,
+			"data": map[string]interface{}{
+				"authorization_url": flwResp.Data.Link,
+				"checkout_url":      flwResp.Data.Link,
+				"link":              flwResp.Data.Link,
+				"reference":         txRef,
+			},
 		})
 	}))
 
@@ -1243,6 +1492,271 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{
 			"status":  "success",
 			"message": "Subscription upgraded successfully",
+		})
+	})
+
+	// =========================================================================
+	// 🛡️ ROUTE 17: FLUTTERWAVE WEBHOOK (DEFENSIVELY VERIFIED & IDEMPOTENT)
+	// =========================================================================
+	http.HandleFunc("/api/v1/webhooks/flutterwave", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, verif-hash")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+			return
+		}
+
+		// Security Check (CRITICAL MANDATE):
+		// Check if secretHash == "" || headerHash == "" { return 401 } before ConstantTimeCompare
+		secretHash := os.Getenv("FLW_SECRET_HASH")
+		headerHash := r.Header.Get("verif-hash")
+		if secretHash == "" || headerHash == "" {
+			slog.Warn("Flutterwave webhook rejected: missing secret hash or verif-hash header")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized. Missing secret hash or verif-hash header."})
+			return
+		}
+
+		if subtle.ConstantTimeCompare([]byte(headerHash), []byte(secretHash)) != 1 {
+			slog.Warn("Flutterwave webhook rejected: invalid verif-hash signature")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Unauthorized. Invalid signature."})
+			return
+		}
+
+		// Read request body with 1MB limit protection against memory exhaustion
+		bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1048576))
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read request body"})
+			return
+		}
+
+		type FlutterwaveCustomer struct {
+			Email string `json:"email"`
+			Name  string `json:"name"`
+		}
+
+		type FlutterwaveWebhookData struct {
+			ID       int64                  `json:"id"`
+			TxRef    string                 `json:"tx_ref"`
+			FlwRef   string                 `json:"flw_ref"`
+			Amount   float64                `json:"amount"`
+			Currency string                 `json:"currency"`
+			Status   string                 `json:"status"`
+			Customer FlutterwaveCustomer    `json:"customer"`
+			Meta     map[string]interface{} `json:"meta"`
+		}
+
+		type FlutterwaveWebhookPayload struct {
+			Event string                 `json:"event"`
+			Data  FlutterwaveWebhookData `json:"data"`
+		}
+
+		var payload FlutterwaveWebhookPayload
+		if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request payload"})
+			return
+		}
+
+		// Only process when event == "charge.completed" and data.status == "successful"
+		if payload.Event != "charge.completed" || strings.ToLower(payload.Data.Status) != "successful" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status":  "ignored",
+				"message": "Event is not successful charge.completed",
+			})
+			return
+		}
+
+		// Defensive verification with Flutterwave API:
+		// Enforce a 3-second context.WithTimeout on the GET /transactions/{id}/verify outbound call
+		flwConfig := models.GetFlutterwaveConfig()
+		verifyURL := fmt.Sprintf("%s/transactions/%d/verify", flwConfig.BaseURL, payload.Data.ID)
+		verifyCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+
+		verifyReq, err := http.NewRequestWithContext(verifyCtx, http.MethodGet, verifyURL, nil)
+		if err != nil {
+			slog.Error("Failed to build Flutterwave verification request", slog.Any("error", err))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to build verification request"})
+			return
+		}
+		verifyReq.Header.Set("Authorization", "Bearer "+flwConfig.SecretKey)
+
+		verifyResp, err := billingHTTPClient.Do(verifyReq)
+		if err != nil {
+			slog.Error("Flutterwave verification request failed or timed out", slog.Any("error", err), slog.Int64("tx_id", payload.Data.ID))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusGatewayTimeout) // 504 signals Flutterwave to automatically schedule retry
+			json.NewEncoder(w).Encode(map[string]string{"error": "Verification request to gateway timed out"})
+			return
+		}
+		defer verifyResp.Body.Close()
+
+		if verifyResp.StatusCode >= 500 {
+			io.Copy(io.Discard, verifyResp.Body)
+			slog.Error("Flutterwave verification returned upstream 5xx error", slog.Int("status_code", verifyResp.StatusCode))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable) // 503 signals Flutterwave to automatically schedule retry
+			json.NewEncoder(w).Encode(map[string]string{"error": "Payment gateway temporarily unavailable"})
+			return
+		}
+
+		if verifyResp.StatusCode != http.StatusOK {
+			io.Copy(io.Discard, verifyResp.Body)
+			slog.Error("Flutterwave verification returned non-200", slog.Int("status_code", verifyResp.StatusCode))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Transaction verification failed at gateway"})
+			return
+		}
+
+		verifyBytes, err := io.ReadAll(verifyResp.Body)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read verification response"})
+			return
+		}
+
+		type FlwVerifyResp struct {
+			Status  string `json:"status"`
+			Message string `json:"message"`
+			Data    struct {
+				ID       int64                  `json:"id"`
+				TxRef    string                 `json:"tx_ref"`
+				Status   string                 `json:"status"`
+				Amount   float64                `json:"amount"`
+				Currency string                 `json:"currency"`
+				Meta     map[string]interface{} `json:"meta"`
+			} `json:"data"`
+		}
+
+		var verifiedData FlwVerifyResp
+		if err := json.Unmarshal(verifyBytes, &verifiedData); err != nil ||
+			strings.ToLower(verifiedData.Status) != "success" ||
+			strings.ToLower(verifiedData.Data.Status) != "successful" {
+			slog.Error("Flutterwave transaction verification rejected", slog.String("response", string(verifyBytes)))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Defensive verification failed: transaction not successful"})
+			return
+		}
+
+		// Validate that the verified amount and currency match a valid subscription plan
+		verifiedAmount := verifiedData.Data.Amount
+		verifiedCurrency := verifiedData.Data.Currency
+		if verifiedCurrency == "" {
+			verifiedCurrency = payload.Data.Currency
+		}
+		planDetails, ok := models.ResolvePlanByAmountAndCurrency(verifiedAmount, verifiedCurrency)
+		if !ok {
+			slog.Warn("Flutterwave verified transaction with unrecognized plan amount or currency", slog.Float64("amount", verifiedAmount), slog.String("currency", verifiedCurrency))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Unexpected payment amount: %v %s", verifiedAmount, verifiedCurrency)})
+			return
+		}
+
+		// Extract workspace_id strictly from meta payload (Mandate: Do not string-split tx_ref)
+		workspaceID := ""
+		if payload.Data.Meta != nil {
+			if ws, ok := payload.Data.Meta["workspace_id"].(string); ok && strings.TrimSpace(ws) != "" {
+				workspaceID = strings.TrimSpace(ws)
+			}
+		}
+		if workspaceID == "" && verifiedData.Data.Meta != nil {
+			if ws, ok := verifiedData.Data.Meta["workspace_id"].(string); ok && strings.TrimSpace(ws) != "" {
+				workspaceID = strings.TrimSpace(ws)
+			}
+		}
+
+		if workspaceID == "" {
+			slog.Error("Missing workspace_id in Flutterwave meta payload", slog.String("tx_ref", payload.Data.TxRef))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid payload: missing workspace_id in meta"})
+			return
+		}
+
+		txRef := payload.Data.TxRef
+		if txRef == "" {
+			txRef = verifiedData.Data.TxRef
+		}
+
+		// Idempotency check: check if txRef has already been recorded in journal_entries
+		if relationalBrain != nil {
+			var exists bool
+			err := relationalBrain.DB.QueryRowContext(r.Context(), "SELECT EXISTS(SELECT 1 FROM journal_entries WHERE reference_id = $1)", txRef).Scan(&exists)
+			if err == nil && exists {
+				slog.Info("Duplicate Flutterwave transaction already processed, acknowledging without duplicate credit", slog.String("workspace_id", workspaceID), slog.String("tx_ref", txRef))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]string{"status": "acknowledged"})
+				return
+			}
+		}
+
+		// Dispatch tier upgrade
+		newTier := planDetails.Tier
+		tokensToAdd := planDetails.Tokens
+
+		if riverClient != nil {
+			_, err = riverClient.Insert(r.Context(), orchestrator.UpgradeWorkspaceJobArgs{
+				WorkspaceID: workspaceID,
+				NewTier:     newTier,
+				TokensToAdd: tokensToAdd,
+				ReferenceID: txRef,
+			}, nil)
+			if err != nil {
+				slog.Error("Failed to enqueue UpgradeWorkspaceJob in River via Flutterwave", slog.String("workspace_id", workspaceID), slog.Any("error", err))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": "Failed to queue upgrade"})
+				return
+			}
+		} else if relationalBrain != nil {
+			slog.Warn("River client is offline, falling back to synchronous execution")
+			ctx := context.WithValue(r.Context(), memory.WorkspaceIDKey, workspaceID)
+			if err := relationalBrain.UpgradeWorkspaceTier(ctx, workspaceID, newTier, tokensToAdd, txRef); err != nil {
+				slog.Error("Failed to upgrade workspace tier synchronously via Flutterwave", slog.String("workspace_id", workspaceID), slog.String("tier", newTier), slog.Any("error", err))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Upgrade failed: %v", err)})
+				return
+			}
+		} else {
+			slog.Warn("Relational DB is offline, skipping actual upgrade", slog.String("workspace_id", workspaceID))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Database subsystem offline"})
+			return
+		}
+
+		slog.Info("Successfully upgraded workspace tier via Flutterwave", slog.String("workspace_id", workspaceID), slog.String("tier", newTier), slog.Int("tokens_added", tokensToAdd), slog.String("tx_ref", txRef))
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "acknowledged",
 		})
 	})
 

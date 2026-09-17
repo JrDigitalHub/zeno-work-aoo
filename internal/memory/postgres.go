@@ -127,6 +127,7 @@ func NewRelationalStore(connectionString string) (*RelationalStore, error) {
 		END IF;
 	END;
 	$$;
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_journal_entries_reference_id ON journal_entries (reference_id) WHERE reference_id IS NOT NULL;
 	`
 	_, err = db.Exec(journalSchema)
 	if err != nil {
